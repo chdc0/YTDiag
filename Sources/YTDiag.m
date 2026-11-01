@@ -189,7 +189,7 @@ static UIWindow *gWindow;
     self.view.backgroundColor = UIColor.clearColor;
     self.view.frame = UIScreen.mainScreen.bounds;
 
-    self.tv = [[UITextView alloc] initWithFrame:CGRectZero];
+    self.tv = [[UITextView alloc] initWithFrame:CGRectMake(0, 0, 0, 0)];
     self.tv.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.92];
     self.tv.textColor = UIColor.greenColor;
     self.tv.font = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightRegular];
