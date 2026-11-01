@@ -210,7 +210,7 @@ static void WatchAlloc(NSString *name) {
 @interface YTDiagVC : UIViewController
 @property (nonatomic, strong) UITextView *tv;
 @property (nonatomic, strong) UIButton *chip;
-@property (nonatomic, strong) UIButton *copyBtn;
+@property (nonatomic, strong) UIButton *clipBtn;
 @property (nonatomic) BOOL open;
 @end
 
@@ -243,22 +243,22 @@ static UIWindow *gWindow;
     [self.chip addTarget:self action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.chip];
 
-    self.copyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.copyBtn.backgroundColor = [[UIColor blueColor] colorWithAlphaComponent:0.85];
-    [self.copyBtn setTitle:@"COPY" forState:UIControlStateNormal];
-    [self.copyBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    self.copyBtn.titleLabel.font = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightBold];
-    [self.copyBtn addTarget:self action:@selector(copyReport) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:self.copyBtn];
+    self.clipBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.clipBtn.backgroundColor = [[UIColor blueColor] colorWithAlphaComponent:0.85];
+    [self.clipBtn setTitle:@"COPY" forState:UIControlStateNormal];
+    [self.clipBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    self.clipBtn.titleLabel.font = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightBold];
+    [self.clipBtn addTarget:self action:@selector(toClipboard) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.clipBtn];
 
     [self layout];
 }
 
-- (void)copyReport {
+- (void)toClipboard {
     UIPasteboard.generalPasteboard.string = [gLines componentsJoinedByString:@"\n"];
-    [self.copyBtn setTitle:@"COPIED" forState:UIControlStateNormal];
+    [self.clipBtn setTitle:@"COPIED" forState:UIControlStateNormal];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [self.copyBtn setTitle:@"COPY" forState:UIControlStateNormal];
+        [self.clipBtn setTitle:@"COPY" forState:UIControlStateNormal];
     });
 }
 
@@ -266,7 +266,7 @@ static UIWindow *gWindow;
     CGFloat w = UIScreen.mainScreen.bounds.size.width;
     CGFloat h = UIScreen.mainScreen.bounds.size.height;
     self.chip.frame = CGRectMake(4, 4, 52, 20);
-    self.copyBtn.frame = CGRectMake(58, 4, 48, 20);
+    self.clipBtn.frame = CGRectMake(58, 4, 48, 20);
     self.tv.frame = CGRectMake(0, 26, w - 8, self.open ? h - 34 : 0);
 }
 
