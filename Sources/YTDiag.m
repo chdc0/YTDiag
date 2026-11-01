@@ -32,8 +32,8 @@ static void YTLogLine(NSString *line) {
     if (gLogPath) {
         [all writeToFile:gLogPath atomically:YES encoding:NSUTF8StringEncoding error:NULL];
     }
-    BOOL isUsed = [line hasPrefix:@"USED "];
-    BOOL autoOpen = (isUsed && !gAutoOpened);
+    BOOL interesting = [line hasPrefix:@"ALLOC "] || [line hasPrefix:@"INIT "];
+    BOOL autoOpen = (interesting && !gAutoOpened);
     if (autoOpen) gAutoOpened = YES;
     [gLock unlock];
 
@@ -150,26 +150,59 @@ static void DumpSelectors(NSString *name, NSUInteger limit) {
 
 // Logs when a class's own -init runs. Only swaps a method the class itself
 // implements, so NSObject's -init is never touched.
+static BOOL ClassImplements(Class c, SEL sel) {
+    unsigned int n = 0;
+    Method *ms = class_copyMethodList(c, &n);
+    BOOL found = NO;
+    for (unsigned i = 0; i < n; i++) {
+        if (method_getName(ms[i]) == sel) { found = YES; break; }
+    }
+    free(ms);
+    return found;
+}
+
 static void WatchInit(NSString *name) {
     Class c = NSClassFromString(name);
     if (!c) { LOG(@"watch %@ -> ABSENT", name); return; }
 
-    unsigned int n = 0;
-    Method *ms = class_copyMethodList(c, &n);
-    BOOL owns = NO;
-    for (unsigned i = 0; i < n; i++) {
-        if (method_getName(ms[i]) == @selector(init)) { owns = YES; break; }
+    if (!ClassImplements(c, @selector(init))) {
+        LOG(@"watch %@ -> no own -init (normal for Swift/factory classes)", name);
+        return;
     }
-    free(ms);
-    if (!owns) { LOG(@"watch %@ -> no own -init", name); return; }
 
     Method m = class_getInstanceMethod(c, @selector(init));
     IMP orig = method_getImplementation(m);
     method_setImplementation(m, imp_implementationWithBlock(^id(id self) {
-        LOG(@"USED %@", name);
+        LOG(@"INIT %@", name);
         return ((id (*)(id, SEL))orig)(self, @selector(init));
     }));
-    LOG(@"watching %@ -init", name);
+}
+
+// Logs every +alloc on a class — the reliable way to see instantiation, whether
+// the class is Objective-C, Swift, or built by a factory with its own initializer.
+static void WatchAlloc(NSString *name) {
+    Class c = NSClassFromString(name);
+    if (!c) { LOG(@"alloc %@ -> ABSENT", name); return; }
+
+    Class meta = object_getClass(c);
+    SEL allocSel = @selector(alloc);
+    BOOL owns = ClassImplements(meta, allocSel);
+    IMP orig = owns ? method_getImplementation(class_getInstanceMethod(meta, allocSel))
+                    : class_getMethodImplementation(class_getSuperclass(meta), allocSel);
+
+    IMP repl = imp_implementationWithBlock(^id(id cls) {
+        LOG(@"ALLOC %@", NSStringFromClass(cls));
+        return ((id (*)(id, SEL))orig)(cls, allocSel);
+    });
+
+    if (owns) {
+        method_setImplementation(class_getInstanceMethod(meta, allocSel), repl);
+        LOG(@"watching +alloc %@ (swapped)", name);
+    } else if (class_addMethod(meta, allocSel, repl, "@@:")) {
+        LOG(@"watching +alloc %@ (added)", name);
+    } else {
+        LOG(@"watching +alloc %@ FAILED", name);
+    }
 }
 
 // ---------------------------------------------------------------- panel
@@ -177,6 +210,7 @@ static void WatchInit(NSString *name) {
 @interface YTDiagVC : UIViewController
 @property (nonatomic, strong) UITextView *tv;
 @property (nonatomic, strong) UIButton *chip;
+@property (nonatomic, strong) UIButton *copyBtn;
 @property (nonatomic) BOOL open;
 @end
 
@@ -209,13 +243,30 @@ static UIWindow *gWindow;
     [self.chip addTarget:self action:@selector(toggle) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.chip];
 
+    self.copyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.copyBtn.backgroundColor = [[UIColor blueColor] colorWithAlphaComponent:0.85];
+    [self.copyBtn setTitle:@"COPY" forState:UIControlStateNormal];
+    [self.copyBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    self.copyBtn.titleLabel.font = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightBold];
+    [self.copyBtn addTarget:self action:@selector(copyReport) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.copyBtn];
+
     [self layout];
+}
+
+- (void)copyReport {
+    UIPasteboard.generalPasteboard.string = [gLines componentsJoinedByString:@"\n"];
+    [self.copyBtn setTitle:@"COPIED" forState:UIControlStateNormal];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self.copyBtn setTitle:@"COPY" forState:UIControlStateNormal];
+    });
 }
 
 - (void)layout {
     CGFloat w = UIScreen.mainScreen.bounds.size.width;
     CGFloat h = UIScreen.mainScreen.bounds.size.height;
     self.chip.frame = CGRectMake(4, 4, 52, 20);
+    self.copyBtn.frame = CGRectMake(58, 4, 48, 20);
     self.tv.frame = CGRectMake(0, 26, w - 8, self.open ? h - 34 : 0);
 }
 
@@ -239,7 +290,7 @@ static UIWindow *gWindow;
     self.open = NO;
     self.tv.hidden = YES;
     [self layout];
-    gWindow.frame = CGRectMake(4, 60, 52, 20);
+    gWindow.frame = CGRectMake(4, 60, 110, 20);
 }
 
 @end
@@ -248,7 +299,7 @@ __attribute__((constructor))
 static void YTDiagStart(void) {
     gLock = [NSLock new];
 
-    LOG(@"YTDiag  %@ %@", @__DATE__, @__TIME__);
+    LOG(@"YTDiag v2  %@ %@", @__DATE__, @__TIME__);
     LOG(@"os        %@", UIDevice.currentDevice.systemVersion);
     LOG(@"device    %@", UIDevice.currentDevice.model);
     LOG(@"bundle    %@", NSBundle.mainBundle.bundleIdentifier);
@@ -276,12 +327,24 @@ static void YTDiagStart(void) {
     DumpSelectors(@"IGDNoAppAttestIntegrityTokenManager", 25);
     DumpSelectors(@"IGDAppAttestChallenge", 25);
     DumpSelectors(@"IGDIntegrityTokenManagerFactory", 25);
+    DumpSelectors(@"GIDSignIn", 20);
     DumpSelectors(@"SSOIdentityPrivate", 30);
 
-    LOG(@"--- instantiation watch ---");
+    LOG(@"--- instantiation watch (ALLOC lines appear below, in time order) ---");
+    for (NSString *name in @[@"IGDAppAttest",
+                             @"IGDAppAttestChallenge",
+                             @"IGDNoAppAttestIntegrityTokenManager",
+                             @"IGDIntegrityTokenManagerFactory",
+                             @"IGDIntegrityTokenManager",
+                             @"IGDManagerOptions",
+                             @"GIDSignIn",
+                             @"ASWebAuthenticationSession",
+                             @"SFAuthenticationSession",
+                             @"SSOIdentityPrivate"]) {
+        WatchAlloc(name);
+    }
     WatchInit(@"IGDAppAttest");
     WatchInit(@"IGDNoAppAttestIntegrityTokenManager");
-    WatchInit(@"IGDAppAttestChallenge");
 
     NSURL *caches = [[NSFileManager defaultManager] URLsForDirectory:NSCachesDirectory
                                                            inDomains:NSUserDomainMask].firstObject;
@@ -301,7 +364,7 @@ static void YTDiagStart(void) {
         w.windowLevel = UIWindowLevelAlert + 50;
         YTDiagVC *vc = [YTDiagVC new];
         w.rootViewController = vc;
-        w.frame = CGRectMake(4, 60, 52, 20);
+        w.frame = CGRectMake(4, 60, 110, 20);
         [w makeKeyAndVisible];
         gWindow = w;
         gPanelVC = vc;
