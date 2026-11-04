@@ -1,0 +1,66 @@
+name: build-mgloader
+
+# Builds MGLoader.dylib (Option A loader skeleton) on a macOS runner.
+# Windows has no iOS toolchain, so this is the only compile path.
+#
+# Besides the artifact upload, this commits the dylib to artifact/ on the branch that was built.
+# That is deliberate: the Windows side picks it up with a plain `git pull`, no API token needed.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "Sources/MGLoader.m"
+      - "build-mgloader.sh"
+      - ".github/workflows/mgloader.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-mgloader
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Select newest Xcode
+        run: |
+          XC="$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+          echo "using $XC"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+
+      - name: Build
+        run: |
+          chmod +x build-mgloader.sh
+          ./build-mgloader.sh
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: MGLoader
+          path: out/MGLoader.dylib
+          if-no-files-found: error
+
+      - name: Commit the dylib back
+        run: |
+          set -euo pipefail
+          mkdir -p artifact
+          cp out/MGLoader.dylib artifact/MGLoader.dylib
+          shasum -a 256 artifact/MGLoader.dylib | cut -d' ' -f1 > artifact/MGLoader.dylib.sha256
+          echo "sha256 $(cat artifact/MGLoader.dylib.sha256)"
+          git config user.name "mgloader-ci"
+          git config user.email "mgloader-ci@users.noreply.github.com"
+          git add artifact
+          if git diff --cached --quiet; then
+            echo "artifact unchanged"
+            exit 0
+          fi
+          git commit -m "MGLoader.dylib $(cut -c1-12 artifact/MGLoader.dylib.sha256)"
+          git push
