@@ -5,6 +5,7 @@ name: build-mgloader
 #
 # Besides the artifact upload, this commits the dylib to artifact/ on the branch that was built.
 # That is deliberate: the Windows side picks it up with a plain `git pull`, no API token needed.
+# Build output is always committed to artifact/last-build.log, so a failure is readable from git.
 
 on:
   workflow_dispatch:
@@ -34,27 +35,34 @@ jobs:
           XC="$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
           echo "using $XC"
           sudo xcode-select -s "$XC"
-          xcodebuild -version
+          xcodebuild -version 2>&1 | tee -a build.log
 
       - name: Build
         run: |
-          chmod +x build-mgloader.sh
-          ./build-mgloader.sh
+          bash -c 'set -o pipefail; ./build-mgloader.sh 2>&1 | tee -a build.log'
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: MGLoader
           path: out/MGLoader.dylib
-          if-no-files-found: error
+          if-no-files-found: warn
 
-      - name: Commit the dylib back
+      - name: Commit the result
+        if: always()
         run: |
           set -euo pipefail
           mkdir -p artifact
-          cp out/MGLoader.dylib artifact/MGLoader.dylib
-          shasum -a 256 artifact/MGLoader.dylib | cut -d' ' -f1 > artifact/MGLoader.dylib.sha256
-          echo "sha256 $(cat artifact/MGLoader.dylib.sha256)"
+          # clang compiles only after the Xcode step, so a failure leaves no dylib: ship the log instead
+          if [ -f out/MGLoader.dylib ]; then
+            cp out/MGLoader.dylib artifact/MGLoader.dylib
+            shasum -a 256 artifact/MGLoader.dylib | cut -d' ' -f1 > artifact/MGLoader.dylib.sha256
+            rm -f artifact/last-build.log
+            echo "dylib  $(cat artifact/MGLoader.dylib.sha256)"
+          else
+            cp build.log artifact/last-build.log 2>/dev/null || true
+            echo "no dylib, log committed"
+          fi
           git config user.name "mgloader-ci"
           git config user.email "mgloader-ci@users.noreply.github.com"
           git add artifact
@@ -62,5 +70,5 @@ jobs:
             echo "artifact unchanged"
             exit 0
           fi
-          git commit -m "MGLoader.dylib $(cut -c1-12 artifact/MGLoader.dylib.sha256)"
+          git commit -m "MGLoader build result"
           git push

@@ -14,9 +14,8 @@
 //
 // Build: see build.sh (clang + iPhoneOS SDK, no Theos). Install name @rpath/MGLoader.dylib.
 
-#import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
-#import <Security/Security.h>
+#import <UIKit/UIKit.h>
 #import <dlfcn.h>
 #import <mach-o/loader.h>
 #import <mach-o/fat.h>
@@ -90,10 +89,28 @@ static NSString *DescribeMachO(NSString *path) {
             type, h->cputype, h->ncmds, h->sizeofcmds, h->flags, fileSize];
 }
 
+// SecTask.h is not reliably importable in the iPhoneOS SDK (same finding as YTDiag.m), so the
+// two entitlement entry points are resolved from the live Security framework instead of linked.
+typedef void *MGSecTaskRef;
+static MGSecTaskRef (*pSecTaskCreateFromSelf)(CFAllocatorRef);
+static CFTypeRef (*pSecTaskCopyValueForEntitlement)(MGSecTaskRef, CFStringRef, CFErrorRef *);
+
+static void ResolveSecTask(void) {
+    if (pSecTaskCreateFromSelf) return;
+    void *h = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY);
+    if (!h) return;
+    pSecTaskCreateFromSelf =
+        (MGSecTaskRef (*)(CFAllocatorRef))dlsym(h, "SecTaskCreateFromSelf");
+    pSecTaskCopyValueForEntitlement =
+        (CFTypeRef (*)(MGSecTaskRef, CFStringRef, CFErrorRef *))dlsym(h, "SecTaskCopyValueForEntitlement");
+}
+
 static NSString *Entitlement(NSString *key) {
-    SecTaskRef task = SecTaskCreateFromSelf(kCFAllocatorDefault);
+    ResolveSecTask();
+    if (!pSecTaskCreateFromSelf || !pSecTaskCopyValueForEntitlement) return @"<no Security>";
+    MGSecTaskRef task = pSecTaskCreateFromSelf(kCFAllocatorDefault);
     if (!task) return @"<no task>";
-    CFTypeRef v = SecTaskCopyValueForEntitlement(task, (__bridge CFStringRef)key, NULL);
+    CFTypeRef v = pSecTaskCopyValueForEntitlement(task, (__bridge CFStringRef)key, NULL);
     CFRelease(task);
     if (!v) return @"<absent>";
     return [NSString stringWithFormat:@"%@", (__bridge id)v];

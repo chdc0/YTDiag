@@ -25,7 +25,6 @@ xcrun --sdk iphoneos clang \
     -fblocks \
     -framework Foundation \
     -framework UIKit \
-    -framework Security \
     -Xlinker -install_name \
     -Xlinker "@rpath/MGLoader.dylib" \
     -o out/MGLoader.dylib \
@@ -35,7 +34,7 @@ size="$(stat -f%z out/MGLoader.dylib)"
 echo "  out/MGLoader.dylib  ${size} bytes"
 
 echo "checking the symbols the loader depends on ..."
-for sym in _dlopen _dlerror _dlsym _SecTaskCreateFromSelf; do
+for sym in _dlopen _dlerror _dlsym; do
     if xcrun nm -u out/MGLoader.dylib | grep -q "$sym"; then
         echo "  ok: $sym"
     else
