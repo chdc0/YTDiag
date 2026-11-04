@@ -28,6 +28,16 @@ static NSLock *gLock;
 static NSString *gLogPath;
 static UITextView *gTextView;
 
+// NSArray has no writeToFile:atomically:encoding:error: (only NSString does), and the
+// plain NSArray variant cannot encode UTF-8, so join first. Also the only lock taker.
+static void MGFlush(void) {
+    if (!gLogPath) return;
+    [gLock lock];
+    NSString *s = [gLines componentsJoinedByString:@"\n"];
+    [gLock unlock];
+    [s writeToFile:gLogPath atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+}
+
 static void MGLOG(NSString *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -38,9 +48,7 @@ static void MGLOG(NSString *fmt, ...) {
     NSUInteger n = gLines.count;
     [gLock unlock];
     NSLog(@"[MG] %@", s);
-    if (n % 8 == 0 && gLogPath) {
-        [gLines writeToFile:gLogPath atomically:YES encoding:NSUTF8StringEncoding error:NULL];
-    }
+    if (n % 8 == 0) MGFlush();
     if (gTextView) {
         dispatch_async(dispatch_get_main_queue(), ^{
             gTextView.text = [gLines componentsJoinedByString:@"\n"];
@@ -187,7 +195,7 @@ static void AttemptLoad(void) {
 @property (nonatomic, strong) UITextView *tv;
 @property (nonatomic, strong) UIButton *chip;
 @property (nonatomic, strong) UIButton *loadBtn;
-@property (nonatomic, strong) UIButton *copyBtn;
+@property (nonatomic, strong) UIButton *clipBtn;
 @property (nonatomic) BOOL open;
 @end
 
@@ -227,13 +235,13 @@ static UIWindow *gWindow;
     [self.loadBtn addTarget:self action:@selector(doLoad) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.loadBtn];
 
-    self.copyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.copyBtn.backgroundColor = [[UIColor blueColor] colorWithAlphaComponent:0.85];
-    [self.copyBtn setTitle:@"COPY" forState:UIControlStateNormal];
-    [self.copyBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-    self.copyBtn.titleLabel.font = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightBold];
-    [self.copyBtn addTarget:self action:@selector(copyLog) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:self.copyBtn];
+    self.clipBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.clipBtn.backgroundColor = [[UIColor blueColor] colorWithAlphaComponent:0.85];
+    [self.clipBtn setTitle:@"COPY" forState:UIControlStateNormal];
+    [self.clipBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    self.clipBtn.titleLabel.font = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightBold];
+    [self.clipBtn addTarget:self action:@selector(copyLog) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.clipBtn];
 
     [self layout];
 }
@@ -243,16 +251,16 @@ static UIWindow *gWindow;
 - (void)doLoad {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         AttemptLoad();
-        [gLines writeToFile:gLogPath atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+        MGFlush();
     });
 }
 
 - (void)copyLog {
     UIPasteboard.generalPasteboard.string = [gLines componentsJoinedByString:@"\n"];
-    [self.copyBtn setTitle:@"COPIED" forState:UIControlStateNormal];
+    [self.clipBtn setTitle:@"COPIED" forState:UIControlStateNormal];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        [self.copyBtn setTitle:@"COPY" forState:UIControlStateNormal];
+        [self.clipBtn setTitle:@"COPY" forState:UIControlStateNormal];
     });
 }
 
@@ -261,7 +269,7 @@ static UIWindow *gWindow;
     CGFloat h = UIScreen.mainScreen.bounds.size.height;
     self.chip.frame = CGRectMake(4, 4, 34, 20);
     self.loadBtn.frame = CGRectMake(40, 4, 46, 20);
-    self.copyBtn.frame = CGRectMake(88, 4, 46, 20);
+    self.clipBtn.frame = CGRectMake(88, 4, 46, 20);
     self.tv.frame = CGRectMake(0, 26, w - 8, self.open ? h - 34 : 0);
 }
 
@@ -302,7 +310,7 @@ static void MGLoaderStart(void) {
     NSURL *caches = [[NSFileManager defaultManager] URLsForDirectory:NSCachesDirectory
                                                            inDomains:NSUserDomainMask].firstObject;
     gLogPath = [[caches URLByAppendingPathComponent:@"mgloader.txt"] path];
-    [gLines writeToFile:gLogPath atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+    MGFlush();
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
