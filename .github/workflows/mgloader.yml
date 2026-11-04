@@ -39,6 +39,7 @@ jobs:
 
       - name: Build
         run: |
+          chmod +x build-mgloader.sh
           bash -c 'set -o pipefail; ./build-mgloader.sh 2>&1 | tee -a build.log'
 
       - name: Upload
