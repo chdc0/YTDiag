@@ -5,11 +5,8 @@ name: build-ytdiag
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - "Sources/**"
-      - "build.sh"
-      - ".github/workflows/build.yml"
+  # push triggers removed 2026-11-04: YTDiag is finished, and "Sources/**" would also fire on
+  # MGLoader edits, burning macOS minutes (10x multiplier on private repos) for nothing.
 
 jobs:
   build:
