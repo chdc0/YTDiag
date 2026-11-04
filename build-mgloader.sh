@@ -25,6 +25,7 @@ xcrun --sdk iphoneos clang \
     -fblocks \
     -framework Foundation \
     -framework UIKit \
+    -framework CoreGraphics \
     -Xlinker -install_name \
     -Xlinker "@rpath/MGLoader.dylib" \
     -o out/MGLoader.dylib \
