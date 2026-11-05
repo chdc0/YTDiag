@@ -1,5 +1,5 @@
-// MGLoader - Option A guest loader (round 4: test whether deferring one lazy flat-namespace import
-// lets the team-signed mode-B guest finish dlopen).
+// MGLoader - Option A guest loader (round 5: after lazy dlopen succeeds, inspect the guest's
+// delegate/factory classes without instantiating them or changing the host UI).
 //
 // Round 1 proved injection but its overlay was unusable: expanding the window moved the hard-coded
 // buttons to y=4, i.e. behind the clock, and they could not be tapped. Round 2 fixes that three ways:
@@ -15,13 +15,14 @@
 // It must never take the host down permanently: every guest touch is inside @try, the probe runs
 // behind a sentinel, and nothing is loaded when the guest is absent.
 //
-// Round 3 proved SideStore recursively signs the mode-B guest with the team's certificate. The
-// device's remaining failure is a flat-namespace constructor import in reanimated.framework. An
-// offline bind-opcode scan found it in that image's lazy_bind stream (dynamic lookup ordinal -2),
-// not its ordinary bind stream. Round 4 changes only RTLD_NOW to RTLD_LAZY: if the symbol is not
-// needed during image initializers, dlopen can return and the log will tell us whether this was only
-// eager resolution. It does not provide the missing implementation; calling the dependent path may
-// still fail. The automatic-probe crash sentinel remains in place.
+// Round 3 proved SideStore signs the mode-B guest with the team's certificate. Round 4 showed that
+// RTLD_LAZY lets dlopen return even though reanimated.framework has an unresolved flat-namespace
+// constructor in its lazy_bind table. That import is deferred, not fixed. Round 5 does read-only
+// Objective-C runtime inspection after dlopen: it logs whether the app delegate, scene delegate,
+// and React Native dependency provider classes registered, their superclasses/protocol conformance,
+// and the lifecycle selectors they implement. It does NOT instantiate a delegate, call
+// UIApplicationMain, or change the visible app. This narrows the next bootstrap step without
+// risking the host. The automatic-probe crash sentinel remains in place.
 //
 // Build: see build.sh (clang + iPhoneOS SDK, no Theos). Install name @rpath/MGLoader.dylib.
 
@@ -36,7 +37,7 @@
 #import <arpa/inet.h>
 #include <string.h>
 
-static const char *kRound = "round 4";
+static const char *kRound = "round 5";
 
 static NSMutableArray<NSString *> *gLines;
 static NSLock *gLock;
@@ -299,6 +300,37 @@ static void ListDocuments(void) {
 // forward: the probe reports its outcome on the chip
 static void MGSetChip(NSString *title, UIColor *bg);
 
+// Read-only runtime reconnaissance. Do not allocate/init guest delegates here: their initializers
+// may assume UIApplicationMain has already run. The class and method metadata tells the bootstrap
+// round which entry points exist without changing the host's UIApplication or scene.
+static NSString *DescribeRuntimeClass(NSString *name) {
+    Class cls = NSClassFromString(name);
+    if (!cls) return @"not registered";
+
+    Class super = class_getSuperclass(cls);
+    BOOL appDelegate = class_conformsToProtocol(cls, @protocol(UIApplicationDelegate));
+    BOOL sceneDelegate = class_conformsToProtocol(cls, @protocol(UISceneDelegate));
+    NSArray<NSString *> *candidates = @[
+        @"application:didFinishLaunchingWithOptions:",
+        @"application:configurationForConnectingSceneSession:options:",
+        @"applicationDidBecomeActive:",
+        @"scene:willConnectToSession:options:",
+        @"sceneDidBecomeActive:",
+        @"sceneWillEnterForeground:",
+        @"sceneDidEnterBackground:"
+    ];
+    NSMutableArray<NSString *> *methods = [NSMutableArray array];
+    for (NSString *candidate in candidates) {
+        if (class_getInstanceMethod(cls, NSSelectorFromString(candidate))) {
+            [methods addObject:candidate];
+        }
+    }
+    return [NSString stringWithFormat:@"found class=%s superclass=%s UIApplicationDelegate=%@ UISceneDelegate=%@ methods=[%@]",
+            class_getName(cls), super ? class_getName(super) : "<none>",
+            appDelegate ? @"yes" : @"no", sceneDelegate ? @"yes" : @"no",
+            [methods componentsJoinedByString:@", "]];
+}
+
 // --------------------------------------------------------------------------- //
 // the one real experiment
 // --------------------------------------------------------------------------- //
@@ -355,6 +387,10 @@ static void AttemptLoad(void) {
     MGLOG(@"dlsym main            %@", mainSym ? [NSString stringWithFormat:@"%p", mainSym] : @"not exported");
     void *sym2 = dlsym(h, "_main");
     MGLOG(@"dlsym _main           %@", sym2 ? [NSString stringWithFormat:@"%p", sym2] : @"not exported");
+    MGLOG(@"guest class TWAppDelegate %@", DescribeRuntimeClass(@"TWAppDelegate"));
+    MGLOG(@"guest class Twitch.SceneDelegate %@", DescribeRuntimeClass(@"Twitch.SceneDelegate"));
+    MGLOG(@"guest class Swift SceneDelegate %@", DescribeRuntimeClass(@"_TtC6Twitch13SceneDelegate"));
+    MGLOG(@"guest class RCTAppDependencyProvider %@", DescribeRuntimeClass(@"RCTAppDependencyProvider"));
 
     // do NOT call the entry point yet: bootstrap is Day 2 work.
 }
