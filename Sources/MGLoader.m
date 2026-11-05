@@ -1,5 +1,5 @@
-// MGLoader - Option A guest loader (round 5: after lazy dlopen succeeds, inspect the guest's
-// delegate/factory classes without instantiating them or changing the host UI).
+// MGLoader - Option A guest loader (round 6: one guarded guest app-delegate launch callback, without
+// replacing the host delegate or creating a guest window).
 //
 // Round 1 proved injection but its overlay was unusable: expanding the window moved the hard-coded
 // buttons to y=4, i.e. behind the clock, and they could not be tapped. Round 2 fixes that three ways:
@@ -15,14 +15,14 @@
 // It must never take the host down permanently: every guest touch is inside @try, the probe runs
 // behind a sentinel, and nothing is loaded when the guest is absent.
 //
-// Round 3 proved SideStore signs the mode-B guest with the team's certificate. Round 4 showed that
-// RTLD_LAZY lets dlopen return even though reanimated.framework has an unresolved flat-namespace
-// constructor in its lazy_bind table. That import is deferred, not fixed. Round 5 does read-only
-// Objective-C runtime inspection after dlopen: it logs whether the app delegate, scene delegate,
-// and React Native dependency provider classes registered, their superclasses/protocol conformance,
-// and the lifecycle selectors they implement. It does NOT instantiate a delegate, call
-// UIApplicationMain, or change the visible app. This narrows the next bootstrap step without
-// risking the host. The automatic-probe crash sentinel remains in place.
+// Round 3 proved SideStore signs the mode-B guest. Round 4 proved RTLD_LAZY defers an unresolved
+// Reanimated constructor (it does not supply it). Round 5 found TWAppDelegate, Twitch.SceneDelegate,
+// and RCTAppDependencyProvider. Round 6 allocates TWAppDelegate once per install and invokes only
+// application:didFinishLaunchingWithOptions: on the main thread, passing the existing UIApplication
+// and nil launch options. It does NOT replace UIApplication.delegate, call UIApplicationMain, invoke
+// the scene delegate, or create a guest window. A persistent attempt marker prevents a second
+// callback even if LOAD is tapped again; the existing automatic-probe sentinel remains the
+// crash-loop guard. We log host delegate/window/scene state before and after the callback.
 //
 // Build: see build.sh (clang + iPhoneOS SDK, no Theos). Install name @rpath/MGLoader.dylib.
 
@@ -37,7 +37,7 @@
 #import <arpa/inet.h>
 #include <string.h>
 
-static const char *kRound = "round 5";
+static const char *kRound = "round 6";
 
 static NSMutableArray<NSString *> *gLines;
 static NSLock *gLock;
@@ -331,6 +331,71 @@ static NSString *DescribeRuntimeClass(NSString *name) {
             [methods componentsJoinedByString:@", "]];
 }
 
+static NSString *RuntimeObjectName(id object) {
+    return object ? NSStringFromClass([object class]) : @"nil";
+}
+
+// One-shot, guarded app-delegate callback. This is the first active guest bootstrap touch: it may
+// initialize Twitch/Expo process-wide services, so do not also attach a scene or show a window here.
+static void AttemptGuestAppDelegateLaunch(void) {
+    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-appdelegate-attempted"];
+    NSFileManager *fm = NSFileManager.defaultManager;
+    if ([fm fileExistsAtPath:attempted]) {
+        MGLOG(@"guest launch callback  skipped (already attempted; delete Documents/MG/guest-appdelegate-attempted to retry)");
+        return;
+    }
+
+    // Write before class realization/init/callback: any crash leaves a clear, persistent one-shot
+    // marker, in addition to the automatic dlopen sentinel.
+    [@"TWAppDelegate launch callback attempted\n" writeToFile:attempted atomically:YES
+                                                      encoding:NSUTF8StringEncoding error:NULL];
+    dispatch_block_t invoke = ^{
+        Class cls = NSClassFromString(@"TWAppDelegate");
+        if (!cls) {
+            MGLOG(@"guest launch callback  TWAppDelegate not registered");
+            return;
+        }
+
+        UIApplication *app = UIApplication.sharedApplication;
+        id hostDelegateBefore = app.delegate;
+        NSUInteger windowsBefore = app.windows.count;
+        NSUInteger scenesBefore = app.connectedScenes.count;
+        MGLOG(@"guest callback before  appDelegate=%@ windows=%lu scenes=%lu state=%ld",
+              RuntimeObjectName(hostDelegateBefore), (unsigned long)windowsBefore,
+              (unsigned long)scenesBefore, (long)app.applicationState);
+
+        @try {
+            id instance = [[cls alloc] init];
+            if (!instance) {
+                MGLOG(@"guest launch callback  TWAppDelegate init returned nil");
+                return;
+            }
+            SEL selector = @selector(application:didFinishLaunchingWithOptions:);
+            if (![instance respondsToSelector:selector]) {
+                MGLOG(@"guest launch callback  selector missing on %@", RuntimeObjectName(instance));
+                return;
+            }
+
+            id<UIApplicationDelegate> guestDelegate = (id<UIApplicationDelegate>)instance;
+            BOOL result = [guestDelegate application:app didFinishLaunchingWithOptions:nil];
+            id hostDelegateAfter = app.delegate;
+            MGLOG(@"guest launch callback  returned %@ instance=%@",
+                  result ? @"YES" : @"NO", RuntimeObjectName(instance));
+            MGLOG(@"guest callback after   appDelegate=%@ unchanged=%@ windows=%lu scenes=%lu state=%ld",
+                  RuntimeObjectName(hostDelegateAfter), hostDelegateAfter == hostDelegateBefore ? @"yes" : @"NO",
+                  (unsigned long)app.windows.count, (unsigned long)app.connectedScenes.count,
+                  (long)app.applicationState);
+        } @catch (NSException *e) {
+            MGLOG(@"guest launch callback  raised %@: %@", e.name, e.reason);
+        }
+    };
+
+    // UIKit lifecycle callbacks belong on main. LOAD may be tapped on main; the automatic probe
+    // invokes AttemptLoad from a worker, where dispatch_sync is safe because the main queue is live.
+    if (NSThread.isMainThread) invoke();
+    else dispatch_sync(dispatch_get_main_queue(), invoke);
+}
+
 // --------------------------------------------------------------------------- //
 // the one real experiment
 // --------------------------------------------------------------------------- //
@@ -391,8 +456,9 @@ static void AttemptLoad(void) {
     MGLOG(@"guest class Twitch.SceneDelegate %@", DescribeRuntimeClass(@"Twitch.SceneDelegate"));
     MGLOG(@"guest class Swift SceneDelegate %@", DescribeRuntimeClass(@"_TtC6Twitch13SceneDelegate"));
     MGLOG(@"guest class RCTAppDependencyProvider %@", DescribeRuntimeClass(@"RCTAppDependencyProvider"));
+    AttemptGuestAppDelegateLaunch();
 
-    // do NOT call the entry point yet: bootstrap is Day 2 work.
+    // Do NOT call the executable entry point or instantiate Twitch.SceneDelegate yet.
 }
 
 // One automatic probe, guarded by a sentinel so a guest that crashes the process can only do it
