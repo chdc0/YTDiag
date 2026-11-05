@@ -1,5 +1,5 @@
-// MGLoader - Option A guest loader (round 8: use the host's captured scene options to call the
-// guest scene delegate on the existing foreground scene).
+// MGLoader - Option A guest loader (round 9: temporarily route UIApplication.delegate to Twitch
+// during the captured guest scene callback, then restore YouTube).
 //
 // Round 1 proved injection but its overlay was unusable: expanding the window moved the hard-coded
 // buttons to y=4, i.e. behind the clock, and they could not be tapped. Round 2 fixes that three ways:
@@ -19,12 +19,12 @@
 // Reanimated constructor (it does not supply it). Round 5 found the guest delegate/factory classes.
 // Round 6's delegate callback trapped because Bundle.main was YouTube; round 7 fixed that with a
 // thread-scoped NSBundle.mainBundle override and confirmed TWAppDelegate returned YES while the
-// host state stayed unchanged. Round 8 passively captures the real UISceneConnectionOptions from
-// YouTube's YTSceneDelegate, forwarding the original method unchanged. After the guest app-delegate
-// callback succeeds, it invokes Twitch.SceneDelegate.willConnect on the same foreground UIWindowScene
-// only if the captured options contain no URL/user activity/notification/shortcut. The callback may
-// create a visible guest window. We do NOT create fake UIKit options, call UIApplicationMain, or
-// replace UIApplication.delegate. Versioned r8 markers preserve prior crash evidence.
+// host state stayed unchanged. Round 8 captured the host's real UISceneConnectionOptions and
+// reached Twitch.SceneDelegate. That callback asked YTAppDelegate for Twitch-only setUpSharePlay.
+// Round 9 temporarily assigns the retained TWAppDelegate only during that callback, then restores
+// YTAppDelegate in @finally. It uses the captured real scene/options and guest Bundle.main scope; it
+// does not call UIApplicationMain or fabricate UIKit objects. The callback may create a visible
+// guest window, and r9 markers preserve all prior crash evidence.
 //
 // Build: see build.sh (clang + iPhoneOS SDK, no Theos). Install name @rpath/MGLoader.dylib.
 
@@ -39,7 +39,7 @@
 #import <arpa/inet.h>
 #include <string.h>
 
-static const char *kRound = "round 8";
+static const char *kRound = "round 9";
 
 static NSMutableArray<NSString *> *gLines;
 static NSLock *gLock;
@@ -413,10 +413,10 @@ static BOOL MGInstallHostSceneOptionsCapture(void) {
 // successful initialization keeps the instance alive for the following scene callback.
 static BOOL AttemptGuestAppDelegateLaunch(void) {
     if (gGuestAppDelegate) return YES;
-    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-appdelegate-in-progress-r8"];
+    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-appdelegate-in-progress-r9"];
     NSFileManager *fm = NSFileManager.defaultManager;
     if ([fm fileExistsAtPath:attempted]) {
-        MGLOG(@"guest launch callback  skipped (round-8 prior attempt did not finish; marker retained)");
+        MGLOG(@"guest launch callback  skipped (round-9 prior attempt did not finish; marker retained)");
         return NO;
     }
 
@@ -547,10 +547,10 @@ static BOOL AttemptGuestSceneConnect(void) {
         return NO;
     }
 
-    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-scene-in-progress-r8"];
+    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-scene-in-progress-r9"];
     NSFileManager *fm = NSFileManager.defaultManager;
     if ([fm fileExistsAtPath:attempted]) {
-        MGLOG(@"guest scene callback   skipped (round-8 marker remains from an incomplete attempt)");
+        MGLOG(@"guest scene callback   skipped (round-9 marker remains from an incomplete attempt)");
         return NO;
     }
 
@@ -616,16 +616,24 @@ static BOOL AttemptGuestSceneConnect(void) {
                 return;
             }
             gGuestSceneDelegate = instance;
+            if (![gGuestAppDelegate respondsToSelector:NSSelectorFromString(@"setUpSharePlay")]) {
+                gGuestSceneDelegate = nil;
+                MGLOG(@"guest scene callback   TWAppDelegate does not implement setUpSharePlay");
+                return;
+            }
+
             id<UISceneDelegate> delegate = (id<UISceneDelegate>)instance;
+            MGLOG(@"guest app delegate     temporarily setting UIApplication.delegate %@ -> %@",
+                  RuntimeObjectName(appDelegateBefore), RuntimeObjectName(gGuestAppDelegate));
+            app.delegate = (id<UIApplicationDelegate>)gGuestAppDelegate;
             [delegate scene:scene willConnectToSession:session options:options];
             connected = YES;
 
             id appDelegateAfter = app.delegate;
             id sceneDelegateAfter = scene.delegate;
-            MGLOG(@"guest scene returned   sceneDelegate=%@",
-                  RuntimeObjectName(instance));
-            MGLOG(@"guest scene after      appDelegate=%@ unchanged=%@ sceneDelegate=%@ unchanged=%@ windows=%lu sceneWindows=%lu state=%ld",
-                  RuntimeObjectName(appDelegateAfter), appDelegateAfter == appDelegateBefore ? @"yes" : @"NO",
+            MGLOG(@"guest scene returned   sceneDelegate=%@", RuntimeObjectName(instance));
+            MGLOG(@"guest scene after      appDelegate=%@ isGuest=%@ sceneDelegate=%@ unchanged=%@ windows=%lu sceneWindows=%lu state=%ld",
+                  RuntimeObjectName(appDelegateAfter), appDelegateAfter == gGuestAppDelegate ? @"yes" : @"NO",
                   RuntimeObjectName(sceneDelegateAfter), sceneDelegateAfter == sceneDelegateBefore ? @"yes" : @"NO",
                   (unsigned long)app.windows.count, (unsigned long)windowScene.windows.count,
                   (long)app.applicationState);
@@ -638,6 +646,12 @@ static BOOL AttemptGuestSceneConnect(void) {
             gGuestSceneDelegate = nil;
             MGLOG(@"guest scene callback   raised %@: %@", e.name, e.reason);
         } @finally {
+            if (scene.delegate != sceneDelegateBefore) scene.delegate = sceneDelegateBefore;
+            MGLOG(@"host scene delegate restored %@ expected=%@",
+                  RuntimeObjectName(scene.delegate), RuntimeObjectName(sceneDelegateBefore));
+            if (app.delegate != appDelegateBefore) app.delegate = appDelegateBefore;
+            MGLOG(@"host app delegate restored %@ expected=%@",
+                  RuntimeObjectName(app.delegate), RuntimeObjectName(appDelegateBefore));
             if (priorScopedBundle) threadDictionary[kGuestMainBundleThreadKey] = priorScopedBundle;
             else [threadDictionary removeObjectForKey:kGuestMainBundleThreadKey];
             MGLOG(@"host main bundle restored %@", NSBundle.mainBundle.bundlePath);
@@ -723,14 +737,14 @@ static void AttemptLoad(void) {
 // once. The sentinel lives in Documents because the container survives launches, not installs.
 static void MGAutoProbe(void) {
     // Versioned so earlier crash markers remain as evidence but do not suppress this test.
-    NSString *sentinel = [MGDocuments() stringByAppendingPathComponent:@"MG/dlopen-in-progress-r8"];
+    NSString *sentinel = [MGDocuments() stringByAppendingPathComponent:@"MG/dlopen-in-progress-r9"];
     NSFileManager *fm = NSFileManager.defaultManager;
 
     MGLOG(@"auto probe            start");
     if ([fm fileExistsAtPath:sentinel]) {
         gLastLoad = @"skipped (previous crash)";
         MGLOG(@"auto probe            previous auto dlopen never returned; skipping");
-        MGLOG(@"auto probe            round-8 sentinel present; inspect crash log before retrying");
+        MGLOG(@"auto probe            round-9 sentinel present; inspect crash log before retrying");
         return;
     }
     if (![fm fileExistsAtPath:GuestExec()]) {
@@ -739,7 +753,7 @@ static void MGAutoProbe(void) {
         return;
     }
 
-    [@"round-8 auto dlopen in progress\n" writeToFile:sentinel atomically:YES
+    [@"round-9 auto dlopen in progress\n" writeToFile:sentinel atomically:YES
                                      encoding:NSUTF8StringEncoding error:NULL];
     MGLOG(@"auto probe            guest present; log flushed, dlopen next");
     MGFlush();
