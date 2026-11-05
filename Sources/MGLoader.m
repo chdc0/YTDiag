@@ -1,5 +1,5 @@
-// MGLoader - Option A guest loader (round 2: log you can always reach, UI that stays out of the
-// status bar, one automatic dlopen probe).
+// MGLoader - Option A guest loader (round 3: mode B - the guest ships inside the app bundle, so
+// SideStore signs it with the real certificate; plus a probe that says who signed the guest).
 //
 // Round 1 proved injection but its overlay was unusable: expanding the window moved the hard-coded
 // buttons to y=4, i.e. behind the clock, and they could not be tapped. Round 2 fixes that three ways:
@@ -15,6 +15,17 @@
 // It must never take the host down permanently: every guest touch is inside @try, the probe runs
 // behind a sentinel, and nothing is loaded when the guest is absent.
 //
+// Round 3 changes only the payload contract. The round-4 device log proved ad-hoc signing is a dead
+// end on iOS 27.2: the guest's blob hashes are valid (errno would be EBADEXEC otherwise) but
+// F_ADDFILESIGS_RETURN answers EPERM, i.e. AMFI policy. LiveContainer stopped bypassing codesign on
+// iOS 26+ for the same reason and now signs guests with the host's certificate. So the guest tree
+// ships at YouTube.app/MG/guests/tv.twitch-31.7/ inside the IPA, SideStore's ldid pass walks the
+// whole .app and re-signs every Mach-O in it, and dlopen gets a team-signed image. The Documents
+// import from mode C still works (and can be forced with Documents/MG/use-documents), but the
+// bundle copy wins by default. The log now also reports the guest's CodeDirectory flags, CMS
+// presence, team id and identifier, so "still ad-hoc" and "signed but something else failed" are
+// distinguishable from the device without another round.
+//
 // Build: see build.sh (clang + iPhoneOS SDK, no Theos). Install name @rpath/MGLoader.dylib.
 
 #import <Foundation/Foundation.h>
@@ -26,8 +37,9 @@
 #import <objc/runtime.h>
 #import <stdarg.h>
 #import <arpa/inet.h>
+#include <string.h>
 
-static const char *kRound = "round 2";
+static const char *kRound = "round 3";
 
 static NSMutableArray<NSString *> *gLines;
 static NSLock *gLock;
@@ -79,11 +91,133 @@ static NSString *MGDocuments(void) {
 }
 
 static NSString *GuestRoot(void) {
-    return [MGDocuments() stringByAppendingPathComponent:@"MG/guests/tv.twitch-31.7"];
+    static NSString *root;
+    if (root) return root;
+
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *rel = @"MG/guests/tv.twitch-31.7";
+    NSString *bundleRoot = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:rel];
+    NSString *docsRoot = [MGDocuments() stringByAppendingPathComponent:rel];
+    NSString *bundleExe = [bundleRoot stringByAppendingPathComponent:@"Twitch.app/Twitch"];
+    NSString *override = [MGDocuments() stringByAppendingPathComponent:@"MG/use-documents"];
+
+    // mode B unless the bundle has no payload or the spike asks for the Documents import
+    if (![fm fileExistsAtPath:override] && [fm fileExistsAtPath:bundleExe]) {
+        root = bundleRoot;
+    } else {
+        root = docsRoot;
+    }
+    return root;
+}
+
+static NSString *GuestMode(void) {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *rel = @"MG/guests/tv.twitch-31.7";
+    BOOL bundled = [fm fileExistsAtPath:[[NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:rel]
+                                         stringByAppendingPathComponent:@"Twitch.app/Twitch"]];
+    BOOL docs = [fm fileExistsAtPath:[[MGDocuments() stringByAppendingPathComponent:rel]
+                                      stringByAppendingPathComponent:@"Twitch.app/Twitch"]];
+    BOOL override = [fm fileExistsAtPath:[MGDocuments() stringByAppendingPathComponent:@"MG/use-documents"]];
+    if (override) return @"C (documents, forced by MG/use-documents)";
+    if (bundled) return docs ? @"B (app bundle; a Documents copy is also present)" : @"B (app bundle)";
+    return @"C (documents; no payload in the app bundle)";
+}
+
+static NSString *GuestRoots(void) {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *rel = @"MG/guests/tv.twitch-31.7";
+    NSString *b = [NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:rel];
+    NSString *d = [MGDocuments() stringByAppendingPathComponent:rel];
+    return [NSString stringWithFormat:@"bundle %@, documents %@",
+            [fm fileExistsAtPath:[b stringByAppendingPathComponent:@"Twitch.app/Twitch"]] ? @"present" : @"absent",
+            [fm fileExistsAtPath:[d stringByAppendingPathComponent:@"Twitch.app/Twitch"]] ? @"present" : @"absent"];
 }
 
 static NSString *GuestExec(void) {
     return [GuestRoot() stringByAppendingPathComponent:@"Twitch.app/Twitch"];
+}
+
+// Who signed the guest? On iOS 26+ that is the difference between "loads" and EPERM, and dlerror
+// does not say. Reads the load commands and at most 64 KB of the signature blob: CodeDirectory
+// flags (0x2 = ad-hoc), CMS presence, team id and identifier - not the pages.
+static NSString *DescribeSignature(NSString *path) {
+    @try {
+        NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:path];
+        if (!fh) return @"missing";
+        // LC_CODE_SIGNATURE is the last command of a linker-produced image; the guest's table is
+        // 18,576 B, so 8 KB would miss it and report a false "no LC_CODE_SIGNATURE".
+        NSData *head = [fh readDataOfLength:65536];
+        if (head.length < 32) { [fh closeFile]; return @"too short"; }
+        const uint8_t *b = head.bytes;
+        if (*(const uint32_t *)b != MH_MAGIC_64) { [fh closeFile]; return @"not a thin arm64 image"; }
+
+        uint32_t ncmds = *(const uint32_t *)(b + 16);
+        uint32_t off = 32, dataoff = 0, datasize = 0;
+        for (uint32_t i = 0; i < ncmds && off + 16 <= head.length; i++) {
+            uint32_t cmd = *(const uint32_t *)(b + off);
+            uint32_t size = *(const uint32_t *)(b + off + 4);
+            if (size < 8) break;
+            if (cmd == LC_CODE_SIGNATURE) {
+                dataoff = *(const uint32_t *)(b + off + 8);
+                datasize = *(const uint32_t *)(b + off + 12);
+            }
+            off += size;
+        }
+        if (!dataoff || !datasize) { [fh closeFile]; return @"no LC_CODE_SIGNATURE"; }
+
+        [fh seekToFileOffset:dataoff];
+        NSData *blob = [fh readDataOfLength:65536];
+        [fh closeFile];
+        if (blob.length < 16) return @"signature blob unreadable";
+        const uint8_t *p = blob.bytes;
+        uint32_t superMagic = ntohl(*(const uint32_t *)p);
+        if (superMagic != 0xfade0cc0) {
+            return [NSString stringWithFormat:@"bad SuperBlob magic %08x", superMagic];
+        }
+
+        uint32_t count = ntohl(*(const uint32_t *)(p + 8));
+        int cdOff = -1;
+        BOOL cms = NO;
+        for (uint32_t i = 0; i < count && 12 + (i + 1) * 8 <= blob.length; i++) {
+            uint32_t type = ntohl(*(const uint32_t *)(p + 12 + i * 8));
+            uint32_t at = ntohl(*(const uint32_t *)(p + 16 + i * 8));
+            if (type == 0) cdOff = (int)at;
+            else if (type == 0x10000) cms = YES;
+        }
+        if (cdOff < 0 || cdOff + 56 > (int)blob.length) return @"no CodeDirectory";
+        const uint8_t *cd = p + cdOff;
+        if (ntohl(*(const uint32_t *)cd) != 0xfade0c02) return @"bad CodeDirectory magic";
+
+        uint32_t version = ntohl(*(const uint32_t *)(cd + 8));
+        uint32_t flags = ntohl(*(const uint32_t *)(cd + 12));
+
+        NSString *team = @"-";
+        if (version >= 0x20200) {
+            uint32_t teamOff = ntohl(*(const uint32_t *)(cd + 48));
+            if (teamOff && cdOff + (int)teamOff < (int)blob.length) {
+                const char *s = (const char *)cd + teamOff;
+                size_t room = blob.length - (cdOff + teamOff);
+                size_t n = strnlen(s, room);
+                if (n > 0 && n < room && [NSString stringWithUTF8String:s]) {
+                    team = [NSString stringWithUTF8String:s];
+                }
+            }
+        }
+        NSString *ident = @"-";
+        uint32_t identOff = ntohl(*(const uint32_t *)(cd + 20));
+        if (identOff && cdOff + (int)identOff < (int)blob.length) {
+            const char *s = (const char *)cd + identOff;
+            size_t room = blob.length - (cdOff + identOff);
+            size_t n = strnlen(s, room);
+            if (n > 0 && n < room && [NSString stringWithUTF8String:s]) {
+                ident = [NSString stringWithUTF8String:s];
+            }
+        }
+        return [NSString stringWithFormat:@"%@ cms=%@ team=%@ ident=%@ flags=0x%08x cd=0x%06x datasize=%u",
+                (flags & 0x2) ? @"adhoc" : @"cert", cms ? @"yes" : @"no", team, ident, flags, version, datasize];
+    } @catch (NSException *e) {
+        return [NSString stringWithFormat:@"probe raised %@", e.name];
+    }
 }
 
 // --------------------------------------------------------------------------- //
@@ -177,6 +311,7 @@ static void AttemptLoad(void) {
     MGLOG(@"--- LOAD ---");
     MGLOG(@"guest                 %@", exe);
     MGLOG(@"header                %@", DescribeMachO(exe));
+    MGLOG(@"signature             %@", DescribeSignature(exe));
 
     NSFileManager *fm = NSFileManager.defaultManager;
     if (![fm fileExistsAtPath:exe]) {
@@ -561,7 +696,10 @@ static void MGLoaderStart(void) {
 
     ListDocuments();
     MGLOG(@"guest root            %@", GuestRoot());
+    MGLOG(@"guest mode            %@", GuestMode());
+    MGLOG(@"guest roots           %@", GuestRoots());
     MGLOG(@"guest header          %@", DescribeMachO(GuestExec()));
+    MGLOG(@"guest signature       %@", DescribeSignature(GuestExec()));
     MGLOG(@"log file              %@", gLogPath);
     MGFlush();
 
