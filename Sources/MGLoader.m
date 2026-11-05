@@ -1,5 +1,5 @@
-// MGLoader - Option A guest loader (round 7: scope NSBundle.mainBundle to the Twitch bundle only
-// while the guarded guest app-delegate launch callback runs).
+// MGLoader - Option A guest loader (round 8: use the host's captured scene options to call the
+// guest scene delegate on the existing foreground scene).
 //
 // Round 1 proved injection but its overlay was unusable: expanding the window moved the hard-coded
 // buttons to y=4, i.e. behind the clock, and they could not be tapped. Round 2 fixes that three ways:
@@ -16,15 +16,15 @@
 // behind a sentinel, and nothing is loaded when the guest is absent.
 //
 // Round 3 proved SideStore signs the mode-B guest. Round 4 proved RTLD_LAZY defers an unresolved
-// Reanimated constructor (it does not supply it). Round 5 found the guest's delegate/factory classes.
-// Round 6 crashed inside TWAppDelegate.application:didFinishLaunchingWithOptions:: the Twitch code
-// reads TWAppGroupName from Bundle.main, but this process still reports the YouTube bundle. Round 7
-// installs a class-method wrapper for +[NSBundle mainBundle] that consults a thread-dictionary
-// override. On the main thread only, the override points to Twitch.app during TWAppDelegate alloc,
-// init, and launch callback; finally it is restored, leaving the host bundle unchanged. We do NOT
-// mutate YouTube's Info.plist, assign UIApplication.delegate, call UIApplicationMain, invoke the
-// scene delegate, or create a guest window. New r7 sentinels preserve old crash evidence while
-// allowing exactly one new test attempt.
+// Reanimated constructor (it does not supply it). Round 5 found the guest delegate/factory classes.
+// Round 6's delegate callback trapped because Bundle.main was YouTube; round 7 fixed that with a
+// thread-scoped NSBundle.mainBundle override and confirmed TWAppDelegate returned YES while the
+// host state stayed unchanged. Round 8 passively captures the real UISceneConnectionOptions from
+// YouTube's YTSceneDelegate, forwarding the original method unchanged. After the guest app-delegate
+// callback succeeds, it invokes Twitch.SceneDelegate.willConnect on the same foreground UIWindowScene
+// only if the captured options contain no URL/user activity/notification/shortcut. The callback may
+// create a visible guest window. We do NOT create fake UIKit options, call UIApplicationMain, or
+// replace UIApplication.delegate. Versioned r8 markers preserve prior crash evidence.
 //
 // Build: see build.sh (clang + iPhoneOS SDK, no Theos). Install name @rpath/MGLoader.dylib.
 
@@ -39,7 +39,7 @@
 #import <arpa/inet.h>
 #include <string.h>
 
-static const char *kRound = "round 7";
+static const char *kRound = "round 8";
 
 static NSMutableArray<NSString *> *gLines;
 static NSLock *gLock;
@@ -49,6 +49,13 @@ static void (^gOnLog)(void);        // set by the panel; called on the main queu
 static NSString *gLastLoad = @"not run";
 static IMP gOriginalMainBundleIMP;
 static NSString * const kGuestMainBundleThreadKey = @"MGLoader.ThreadGuestMainBundle";
+static id gGuestAppDelegate;
+static id gGuestSceneDelegate;
+static UIScene *gHostConnectedScene;
+static UISceneSession *gHostSceneSession;
+static UISceneConnectionOptions *gHostSceneConnectionOptions;
+static IMP gOriginalHostSceneWillConnectIMP;
+static BOOL gHostSceneOptionsCaptureInstalled;
 
 // --------------------------------------------------------------------------- //
 // logging
@@ -361,20 +368,63 @@ static BOOL MGInstallMainBundleScope(void) {
     return installed;
 }
 
-// One-shot, guarded app-delegate callback. This is the first active guest bootstrap touch: it may
-// initialize Twitch/Expo process-wide services, so do not also attach a scene or show a window here.
-static void AttemptGuestAppDelegateLaunch(void) {
-    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-appdelegate-attempted-bundle-r7"];
-    NSFileManager *fm = NSFileManager.defaultManager;
-    if ([fm fileExistsAtPath:attempted]) {
-        MGLOG(@"guest launch callback  skipped (round-7 bundle callback already attempted)");
-        return;
+// Capture UIKit's real, immutable connection-options object for the host scene. The wrapper stores
+// the arguments and forwards the original YTSceneDelegate implementation unchanged; we never
+// fabricate UISceneConnectionOptions (UIKit marks its public init/new unavailable).
+static void MGHostSceneWillConnect(id self, SEL cmd, UIScene *scene,
+                                   UISceneSession *session, UISceneConnectionOptions *options) {
+    gHostConnectedScene = scene;
+    gHostSceneSession = session;
+    gHostSceneConnectionOptions = options;
+
+    IMP original = gOriginalHostSceneWillConnectIMP;
+    if (original) {
+        ((void (*)(id, SEL, UIScene *, UISceneSession *, UISceneConnectionOptions *))original)
+            (self, cmd, scene, session, options);
     }
 
-    // Write before class realization/init/callback: any crash leaves a clear, persistent round-7
-    // marker, in addition to the versioned automatic dlopen sentinel.
-    [@"TWAppDelegate launch callback attempted with guest main bundle\n" writeToFile:attempted atomically:YES
+    NSUInteger urls = options.URLContexts.count;
+    NSUInteger activities = options.userActivities.count;
+    MGLOG(@"host scene options captured scene=%@ session=%@ options=%@ URLs=%lu activities=%lu source=%@ handoff=%@",
+          RuntimeObjectName(scene), session.persistentIdentifier, RuntimeObjectName(options),
+          (unsigned long)urls, (unsigned long)activities,
+          options.sourceApplication ?: @"<nil>", options.handoffUserActivityType ?: @"<nil>");
+}
+
+static BOOL MGInstallHostSceneOptionsCapture(void) {
+    if (gHostSceneOptionsCaptureInstalled) return YES;
+    Class cls = NSClassFromString(@"YTSceneDelegate");
+    if (!cls) return NO;
+    SEL selector = @selector(scene:willConnectToSession:options:);
+    Method method = class_getInstanceMethod(cls, selector);
+    if (!method) return NO;
+
+    IMP original = method_getImplementation(method);
+    if (original == (IMP)MGHostSceneWillConnect) {
+        gHostSceneOptionsCaptureInstalled = YES;
+        return YES;
+    }
+    gOriginalHostSceneWillConnectIMP = method_setImplementation(method, (IMP)MGHostSceneWillConnect);
+    gHostSceneOptionsCaptureInstalled = (gOriginalHostSceneWillConnectIMP != NULL);
+    return gHostSceneOptionsCaptureInstalled;
+}
+
+// Initialize the guest app delegate once per process. An in-progress marker remains only on failure;
+// successful initialization keeps the instance alive for the following scene callback.
+static BOOL AttemptGuestAppDelegateLaunch(void) {
+    if (gGuestAppDelegate) return YES;
+    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-appdelegate-in-progress-r8"];
+    NSFileManager *fm = NSFileManager.defaultManager;
+    if ([fm fileExistsAtPath:attempted]) {
+        MGLOG(@"guest launch callback  skipped (round-8 prior attempt did not finish; marker retained)");
+        return NO;
+    }
+
+    // Write before class realization/init/callback: a crash leaves a persistent marker so a new
+    // process cannot silently rerun the guest's launch sequence.
+    [@"TWAppDelegate launch callback in progress\n" writeToFile:attempted atomically:YES
                                                       encoding:NSUTF8StringEncoding error:NULL];
+    __block BOOL callbackSucceeded = NO;
     dispatch_block_t invoke = ^{
         Class cls = NSClassFromString(@"TWAppDelegate");
         if (!cls) {
@@ -441,6 +491,11 @@ static void AttemptGuestAppDelegateLaunch(void) {
                   RuntimeObjectName(hostDelegateAfter), hostDelegateAfter == hostDelegateBefore ? @"yes" : @"NO",
                   (unsigned long)app.windows.count, (unsigned long)app.connectedScenes.count,
                   (long)app.applicationState);
+            if (result) {
+                gGuestAppDelegate = instance;
+                callbackSucceeded = YES;
+                [fm removeItemAtPath:attempted error:NULL];
+            }
         } @catch (NSException *e) {
             MGLOG(@"guest launch callback  raised %@: %@", e.name, e.reason);
         } @finally {
@@ -455,6 +510,144 @@ static void AttemptGuestAppDelegateLaunch(void) {
     // invokes AttemptLoad from a worker, where dispatch_sync is safe because the main queue is live.
     if (NSThread.isMainThread) invoke();
     else dispatch_sync(dispatch_get_main_queue(), invoke);
+    return callbackSucceeded;
+}
+
+static BOOL AttemptGuestSceneConnect(void) {
+    if (gGuestSceneDelegate) {
+        MGLOG(@"guest scene callback   skipped (scene delegate already connected in this process)");
+        return YES;
+    }
+    if (!gGuestAppDelegate) {
+        MGLOG(@"guest scene callback   skipped (TWAppDelegate launch did not succeed)");
+        return NO;
+    }
+    if (!gHostSceneOptionsCaptureInstalled || !gHostConnectedScene || !gHostSceneSession ||
+        !gHostSceneConnectionOptions) {
+        MGLOG(@"guest scene callback   skipped (no real host UIScene/options captured)");
+        return NO;
+    }
+
+    UISceneConnectionOptions *options = gHostSceneConnectionOptions;
+    NSUInteger urlCount = options.URLContexts.count;
+    NSUInteger activityCount = options.userActivities.count;
+    NSString *sourceApplication = options.sourceApplication;
+    NSString *handoffType = options.handoffUserActivityType;
+    BOOL hasShortcut = (options.shortcutItem != nil);
+    BOOL hasNotification = (options.notificationResponse != nil);
+    BOOL hasCloudShare = (options.cloudKitShareMetadata != nil);
+    MGLOG(@"host scene options     urls=%lu activities=%lu source=%@ handoff=%@ shortcut=%@ notification=%@ cloudShare=%@",
+          (unsigned long)urlCount, (unsigned long)activityCount,
+          sourceApplication ?: @"<nil>", handoffType ?: @"<nil>",
+          hasShortcut ? @"yes" : @"no", hasNotification ? @"yes" : @"no",
+          hasCloudShare ? @"yes" : @"no");
+    if (urlCount || activityCount || sourceApplication.length || handoffType.length ||
+        hasShortcut || hasNotification || hasCloudShare) {
+        MGLOG(@"guest scene callback   skipped (host launch carried user-specific connection options)");
+        return NO;
+    }
+
+    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-scene-in-progress-r8"];
+    NSFileManager *fm = NSFileManager.defaultManager;
+    if ([fm fileExistsAtPath:attempted]) {
+        MGLOG(@"guest scene callback   skipped (round-8 marker remains from an incomplete attempt)");
+        return NO;
+    }
+
+    Class cls = NSClassFromString(@"Twitch.SceneDelegate");
+    if (!cls) {
+        MGLOG(@"guest scene callback   Twitch.SceneDelegate not registered");
+        return NO;
+    }
+    SEL selector = @selector(scene:willConnectToSession:options:);
+    if (![cls instancesRespondToSelector:selector]) {
+        MGLOG(@"guest scene callback   willConnect selector missing");
+        return NO;
+    }
+
+    // The versioned marker is written before class realization/init/callback. Leave it in place on
+    // a crash; remove it only after the callback returns normally.
+    [@"Twitch.SceneDelegate willConnect in progress with captured host options\n"
+        writeToFile:attempted atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+    __block BOOL connected = NO;
+    dispatch_block_t connect = ^{
+        UIScene *scene = gHostConnectedScene;
+        UISceneSession *session = gHostSceneSession;
+        if (![scene isKindOfClass:[UIWindowScene class]]) {
+            MGLOG(@"guest scene callback   captured scene is not UIWindowScene: %@", RuntimeObjectName(scene));
+            return;
+        }
+
+        UIApplication *app = UIApplication.sharedApplication;
+        id appDelegateBefore = app.delegate;
+        id sceneDelegateBefore = scene.delegate;
+        UIWindowScene *windowScene = (UIWindowScene *)scene;
+        NSUInteger windowsBefore = app.windows.count;
+        NSUInteger sceneWindowsBefore = windowScene.windows.count;
+        MGLOG(@"guest scene before     appDelegate=%@ sceneDelegate=%@ windows=%lu sceneWindows=%lu state=%ld",
+              RuntimeObjectName(appDelegateBefore), RuntimeObjectName(sceneDelegateBefore),
+              (unsigned long)windowsBefore, (unsigned long)sceneWindowsBefore,
+              (long)app.applicationState);
+
+        NSString *guestBundlePath = [[GuestRoot() stringByAppendingPathComponent:@"Twitch.app"]
+                                     stringByStandardizingPath];
+        NSBundle *guestBundle = [NSBundle bundleWithPath:guestBundlePath];
+        if (!guestBundle || !MGInstallMainBundleScope()) {
+            MGLOG(@"guest scene callback   cannot establish guest NSBundle.mainBundle scope");
+            return;
+        }
+
+        NSMutableDictionary *threadDictionary = NSThread.currentThread.threadDictionary;
+        id priorScopedBundle = threadDictionary[kGuestMainBundleThreadKey];
+        threadDictionary[kGuestMainBundleThreadKey] = guestBundle;
+        @try {
+            NSBundle *observedMainBundle = NSBundle.mainBundle;
+            id groupName = [observedMainBundle objectForInfoDictionaryKey:@"TWAppGroupName"];
+            MGLOG(@"guest scene bundle     scoped=%@ TWAppGroupName=%@",
+                  observedMainBundle.bundlePath, groupName ?: @"<absent>");
+            if (![observedMainBundle.bundlePath isEqualToString:guestBundle.bundlePath] || !groupName) {
+                MGLOG(@"guest scene callback   guest main bundle/config unavailable; callback not called");
+                return;
+            }
+
+            id instance = [[cls alloc] init];
+            if (!instance) {
+                MGLOG(@"guest scene callback   SceneDelegate init returned nil");
+                return;
+            }
+            gGuestSceneDelegate = instance;
+            id<UISceneDelegate> delegate = (id<UISceneDelegate>)instance;
+            [delegate scene:scene willConnectToSession:session options:options];
+            connected = YES;
+
+            id appDelegateAfter = app.delegate;
+            id sceneDelegateAfter = scene.delegate;
+            MGLOG(@"guest scene returned   sceneDelegate=%@",
+                  RuntimeObjectName(instance));
+            MGLOG(@"guest scene after      appDelegate=%@ unchanged=%@ sceneDelegate=%@ unchanged=%@ windows=%lu sceneWindows=%lu state=%ld",
+                  RuntimeObjectName(appDelegateAfter), appDelegateAfter == appDelegateBefore ? @"yes" : @"NO",
+                  RuntimeObjectName(sceneDelegateAfter), sceneDelegateAfter == sceneDelegateBefore ? @"yes" : @"NO",
+                  (unsigned long)app.windows.count, (unsigned long)windowScene.windows.count,
+                  (long)app.applicationState);
+            for (UIWindow *w in windowScene.windows) {
+                MGLOG(@"scene window           class=%@ key=%@ hidden=%@ root=%@",
+                      RuntimeObjectName(w), w.isKeyWindow ? @"yes" : @"no",
+                      w.hidden ? @"yes" : @"no", RuntimeObjectName(w.rootViewController));
+            }
+        } @catch (NSException *e) {
+            gGuestSceneDelegate = nil;
+            MGLOG(@"guest scene callback   raised %@: %@", e.name, e.reason);
+        } @finally {
+            if (priorScopedBundle) threadDictionary[kGuestMainBundleThreadKey] = priorScopedBundle;
+            else [threadDictionary removeObjectForKey:kGuestMainBundleThreadKey];
+            MGLOG(@"host main bundle restored %@", NSBundle.mainBundle.bundlePath);
+        }
+    };
+
+    if (NSThread.isMainThread) connect();
+    else dispatch_sync(dispatch_get_main_queue(), connect);
+    if (connected) [fm removeItemAtPath:attempted error:NULL];
+    return connected;
 }
 
 // --------------------------------------------------------------------------- //
@@ -517,23 +710,27 @@ static void AttemptLoad(void) {
     MGLOG(@"guest class Twitch.SceneDelegate %@", DescribeRuntimeClass(@"Twitch.SceneDelegate"));
     MGLOG(@"guest class Swift SceneDelegate %@", DescribeRuntimeClass(@"_TtC6Twitch13SceneDelegate"));
     MGLOG(@"guest class RCTAppDependencyProvider %@", DescribeRuntimeClass(@"RCTAppDependencyProvider"));
-    AttemptGuestAppDelegateLaunch();
+    if (AttemptGuestAppDelegateLaunch()) {
+        AttemptGuestSceneConnect();
+    } else {
+        MGLOG(@"guest scene callback   not attempted because app-delegate launch did not succeed");
+    }
 
-    // Do NOT call the executable entry point or instantiate Twitch.SceneDelegate yet.
+    // Do NOT call the executable entry point or UIApplicationMain.
 }
 
 // One automatic probe, guarded by a sentinel so a guest that crashes the process can only do it
 // once. The sentinel lives in Documents because the container survives launches, not installs.
 static void MGAutoProbe(void) {
-    // Versioned so the round-6 crash marker remains as evidence but does not suppress this new test.
-    NSString *sentinel = [MGDocuments() stringByAppendingPathComponent:@"MG/dlopen-in-progress-r7"];
+    // Versioned so earlier crash markers remain as evidence but do not suppress this test.
+    NSString *sentinel = [MGDocuments() stringByAppendingPathComponent:@"MG/dlopen-in-progress-r8"];
     NSFileManager *fm = NSFileManager.defaultManager;
 
     MGLOG(@"auto probe            start");
     if ([fm fileExistsAtPath:sentinel]) {
         gLastLoad = @"skipped (previous crash)";
         MGLOG(@"auto probe            previous auto dlopen never returned; skipping");
-        MGLOG(@"auto probe            round-7 sentinel present; inspect crash log before retrying");
+        MGLOG(@"auto probe            round-8 sentinel present; inspect crash log before retrying");
         return;
     }
     if (![fm fileExistsAtPath:GuestExec()]) {
@@ -542,7 +739,7 @@ static void MGAutoProbe(void) {
         return;
     }
 
-    [@"round-7 auto dlopen in progress\n" writeToFile:sentinel atomically:YES
+    [@"round-8 auto dlopen in progress\n" writeToFile:sentinel atomically:YES
                                      encoding:NSUTF8StringEncoding error:NULL];
     MGLOG(@"auto probe            guest present; log flushed, dlopen next");
     MGFlush();
@@ -845,7 +1042,10 @@ static void MGLoaderStart(void) {
                                                            inDomains:NSUserDomainMask].firstObject;
     gMirrorPath = [[caches URLByAppendingPathComponent:@"mgloader.txt"] path];
 
+    BOOL sceneHook = MGInstallHostSceneOptionsCapture();
+
     MGLOG(@"MGLoader %s  %@ %@", kRound, @__DATE__, @__TIME__);
+    MGLOG(@"host scene options hook %@", sceneHook ? @"installed" : @"not installed");
     MGLOG(@"os                    %@", UIDevice.currentDevice.systemVersion);
     MGLOG(@"device                %@", UIDevice.currentDevice.model);
     MGLOG(@"bundle                %@", NSBundle.mainBundle.bundleIdentifier);
