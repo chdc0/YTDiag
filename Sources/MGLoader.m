@@ -1,5 +1,5 @@
-// MGLoader - Option A guest loader (round 9: temporarily route UIApplication.delegate to Twitch
-// during the captured guest scene callback, then restore YouTube).
+// MGLoader - Option A guest loader (round 10: pin the host app delegate strongly across the
+// temporary guest-delegate scene handoff).
 //
 // Round 1 proved injection but its overlay was unusable: expanding the window moved the hard-coded
 // buttons to y=4, i.e. behind the clock, and they could not be tapped. Round 2 fixes that three ways:
@@ -21,10 +21,13 @@
 // thread-scoped NSBundle.mainBundle override and confirmed TWAppDelegate returned YES while the
 // host state stayed unchanged. Round 8 captured the host's real UISceneConnectionOptions and
 // reached Twitch.SceneDelegate. That callback asked YTAppDelegate for Twitch-only setUpSharePlay.
-// Round 9 temporarily assigns the retained TWAppDelegate only during that callback, then restores
-// YTAppDelegate in @finally. It uses the captured real scene/options and guest Bundle.main scope; it
-// does not call UIApplicationMain or fabricate UIKit objects. The callback may create a visible
-// guest window, and r9 markers preserve all prior crash evidence.
+// Round 9 temporarily assigned TWAppDelegate during that callback and created the first
+// TWWindow/Twitch.RootViewController. Two later crashes suggest the original YTAppDelegate may have
+// been deallocated: UIApplication.delegate is assign, and UIKit later sent
+// shouldSaveApplicationState: to an OS_dispatch_source. Round 10 pins the original YTAppDelegate
+// process-wide, restores that exact instance in @finally, and logs pointer identity. It otherwise
+// keeps the real scene/options and guest bundle scope, with fresh r10 sentinels preserving the r9
+// crash evidence.
 //
 // Build: see build.sh (clang + iPhoneOS SDK, no Theos). Install name @rpath/MGLoader.dylib.
 
@@ -39,7 +42,7 @@
 #import <arpa/inet.h>
 #include <string.h>
 
-static const char *kRound = "round 9";
+static const char *kRound = "round 10";
 
 static NSMutableArray<NSString *> *gLines;
 static NSLock *gLock;
@@ -51,6 +54,7 @@ static IMP gOriginalMainBundleIMP;
 static NSString * const kGuestMainBundleThreadKey = @"MGLoader.ThreadGuestMainBundle";
 static id gGuestAppDelegate;
 static id gGuestSceneDelegate;
+static id __strong gHostAppDelegate; // strong pin; UIApplication.delegate is assign
 static UIScene *gHostConnectedScene;
 static UISceneSession *gHostSceneSession;
 static UISceneConnectionOptions *gHostSceneConnectionOptions;
@@ -413,10 +417,10 @@ static BOOL MGInstallHostSceneOptionsCapture(void) {
 // successful initialization keeps the instance alive for the following scene callback.
 static BOOL AttemptGuestAppDelegateLaunch(void) {
     if (gGuestAppDelegate) return YES;
-    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-appdelegate-in-progress-r9"];
+    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-appdelegate-in-progress-r10"];
     NSFileManager *fm = NSFileManager.defaultManager;
     if ([fm fileExistsAtPath:attempted]) {
-        MGLOG(@"guest launch callback  skipped (round-9 prior attempt did not finish; marker retained)");
+        MGLOG(@"guest launch callback  skipped (round-10 prior attempt did not finish; marker retained)");
         return NO;
     }
 
@@ -547,10 +551,10 @@ static BOOL AttemptGuestSceneConnect(void) {
         return NO;
     }
 
-    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-scene-in-progress-r9"];
+    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-scene-in-progress-r10"];
     NSFileManager *fm = NSFileManager.defaultManager;
     if ([fm fileExistsAtPath:attempted]) {
-        MGLOG(@"guest scene callback   skipped (round-9 marker remains from an incomplete attempt)");
+        MGLOG(@"guest scene callback   skipped (round-10 marker remains from an incomplete attempt)");
         return NO;
     }
 
@@ -580,12 +584,16 @@ static BOOL AttemptGuestSceneConnect(void) {
 
         UIApplication *app = UIApplication.sharedApplication;
         id appDelegateBefore = app.delegate;
+        if (!gHostAppDelegate) gHostAppDelegate = appDelegateBefore;
+        id hostDelegateRestore = gHostAppDelegate ?: appDelegateBefore;
         id sceneDelegateBefore = scene.delegate;
         UIWindowScene *windowScene = (UIWindowScene *)scene;
         NSUInteger windowsBefore = app.windows.count;
         NSUInteger sceneWindowsBefore = windowScene.windows.count;
-        MGLOG(@"guest scene before     appDelegate=%@ sceneDelegate=%@ windows=%lu sceneWindows=%lu state=%ld",
-              RuntimeObjectName(appDelegateBefore), RuntimeObjectName(sceneDelegateBefore),
+        MGLOG(@"guest scene before     appDelegate=%@/%p pinnedHost=%@/%p sceneDelegate=%@ windows=%lu sceneWindows=%lu state=%ld",
+              RuntimeObjectName(appDelegateBefore), appDelegateBefore,
+              RuntimeObjectName(hostDelegateRestore), hostDelegateRestore,
+              RuntimeObjectName(sceneDelegateBefore),
               (unsigned long)windowsBefore, (unsigned long)sceneWindowsBefore,
               (long)app.applicationState);
 
@@ -623,8 +631,9 @@ static BOOL AttemptGuestSceneConnect(void) {
             }
 
             id<UISceneDelegate> delegate = (id<UISceneDelegate>)instance;
-            MGLOG(@"guest app delegate     temporarily setting UIApplication.delegate %@ -> %@",
-                  RuntimeObjectName(appDelegateBefore), RuntimeObjectName(gGuestAppDelegate));
+            MGLOG(@"guest app delegate     temporarily setting UIApplication.delegate %@/%p -> %@/%p",
+                  RuntimeObjectName(appDelegateBefore), appDelegateBefore,
+                  RuntimeObjectName(gGuestAppDelegate), gGuestAppDelegate);
             app.delegate = (id<UIApplicationDelegate>)gGuestAppDelegate;
             [delegate scene:scene willConnectToSession:session options:options];
             connected = YES;
@@ -649,9 +658,10 @@ static BOOL AttemptGuestSceneConnect(void) {
             if (scene.delegate != sceneDelegateBefore) scene.delegate = sceneDelegateBefore;
             MGLOG(@"host scene delegate restored %@ expected=%@",
                   RuntimeObjectName(scene.delegate), RuntimeObjectName(sceneDelegateBefore));
-            if (app.delegate != appDelegateBefore) app.delegate = appDelegateBefore;
-            MGLOG(@"host app delegate restored %@ expected=%@",
-                  RuntimeObjectName(app.delegate), RuntimeObjectName(appDelegateBefore));
+            if (app.delegate != hostDelegateRestore) app.delegate = hostDelegateRestore;
+            MGLOG(@"host app delegate restored %@/%p expected=%@/%p",
+                  RuntimeObjectName(app.delegate), app.delegate,
+                  RuntimeObjectName(hostDelegateRestore), hostDelegateRestore);
             if (priorScopedBundle) threadDictionary[kGuestMainBundleThreadKey] = priorScopedBundle;
             else [threadDictionary removeObjectForKey:kGuestMainBundleThreadKey];
             MGLOG(@"host main bundle restored %@", NSBundle.mainBundle.bundlePath);
@@ -737,14 +747,14 @@ static void AttemptLoad(void) {
 // once. The sentinel lives in Documents because the container survives launches, not installs.
 static void MGAutoProbe(void) {
     // Versioned so earlier crash markers remain as evidence but do not suppress this test.
-    NSString *sentinel = [MGDocuments() stringByAppendingPathComponent:@"MG/dlopen-in-progress-r9"];
+    NSString *sentinel = [MGDocuments() stringByAppendingPathComponent:@"MG/dlopen-in-progress-r10"];
     NSFileManager *fm = NSFileManager.defaultManager;
 
     MGLOG(@"auto probe            start");
     if ([fm fileExistsAtPath:sentinel]) {
         gLastLoad = @"skipped (previous crash)";
         MGLOG(@"auto probe            previous auto dlopen never returned; skipping");
-        MGLOG(@"auto probe            round-9 sentinel present; inspect crash log before retrying");
+        MGLOG(@"auto probe            round-10 sentinel present; inspect crash log before retrying");
         return;
     }
     if (![fm fileExistsAtPath:GuestExec()]) {
@@ -753,7 +763,7 @@ static void MGAutoProbe(void) {
         return;
     }
 
-    [@"round-9 auto dlopen in progress\n" writeToFile:sentinel atomically:YES
+    [@"round-10 auto dlopen in progress\n" writeToFile:sentinel atomically:YES
                                      encoding:NSUTF8StringEncoding error:NULL];
     MGLOG(@"auto probe            guest present; log flushed, dlopen next");
     MGFlush();
