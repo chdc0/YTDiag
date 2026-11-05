@@ -1,5 +1,5 @@
-// MGLoader - Option A guest loader (round 13: single-flight LOAD, preserved per-run log, and
-// checkpoints around the SharePlay shim and guest scene callback).
+// MGLoader - Option A guest loader (round 14: virtualize Twitch's App Group container and defaults
+// suite under YouTube's data container; keep keychain untouched for this controlled test).
 //
 // Round 1 proved injection but its overlay was unusable: expanding the window moved the hard-coded
 // buttons to y=4, i.e. behind the clock, and they could not be tapped. Round 2 fixes that three ways:
@@ -25,12 +25,13 @@
 // TWWindow/Twitch.RootViewController, but later backgrounding crashed. Round 10 pinned YTAppDelegate,
 // but scene initialization still trapped and UIKit state restoration remained unstable. Round 11
 // confirmed the host lacks Twitch's app-group entitlement and the group's container URL is nil.
-// Round 12 showed the SharePlay skip alone did not stabilize scene startup; its top seven Twitch
-// frames matched the r10 scene trap. Round 13 keeps the r12 behavior, but adds diagnostics only:
-// 1. LOAD becomes single-flight and manual-only, so an automatic probe cannot race a tapped LOAD.
-// 2. The previous run's mgloader.txt is preserved as mgloader.previous.txt before truncation.
-// 3. Checkpoints log shim installation/invocation and every guest scene callback stage.
-// No UIApplicationMain, fabricated scene/options, or UIApplication.delegate swap.
+// LiveContainer's r13 log proved the exact scene callback can return when Twitch's group container
+// is resolvable. It also showed 128 LiveContainer keychain groups, while SideStore has no keychain
+// groups, so round 14 isolates only App Group behavior: redirect the exact Twitch group container
+// and NSUserDefaults suite into YouTube's sandbox, leaving keychain behavior unchanged. LOAD stays
+// manual-only and single-flight; previous logs are preserved and checkpoints remain enabled.
+// No entitlement is forged, no guest tree is re-signed here, and no UIApplicationMain or delegate
+// swap is used.
 //
 // Build: see build.sh (clang + iPhoneOS SDK, no Theos). Install name @rpath/MGLoader.dylib.
 
@@ -45,7 +46,7 @@
 #import <arpa/inet.h>
 #include <string.h>
 
-static const char *kRound = "round 13";
+static const char *kRound = "round 14";
 
 static NSMutableArray<NSString *> *gLines;
 static NSLock *gLock;
@@ -54,9 +55,12 @@ static NSString *gMirrorPath;       // Library/Caches/mgloader.txt (kept for com
 static void (^gOnLog)(void);        // set by the panel; called on the main queue
 static NSString *gLastLoad = @"not run";
 static IMP gOriginalMainBundleIMP;
+static IMP gOriginalContainerURLIMP;
+static IMP gOriginalInitWithSuiteIMP;
 static NSString * const kGuestMainBundleThreadKey = @"MGLoader.ThreadGuestMainBundle";
 static NSString * const kGuestSharePlaySkipThreadKey = @"MGLoader.SkipGuestSharePlay";
 static BOOL gLoadInProgress = NO;
+static NSLock *gLoadLock;
 static id gGuestAppDelegate;
 static id gGuestSceneDelegate;
 static UIScene *gHostConnectedScene;
@@ -376,6 +380,89 @@ static BOOL MGInstallMainBundleScope(void) {
     return installed;
 }
 
+// Virtualize Twitch's unavailable App Group into a persistent directory under YouTube's container.
+// This is intentionally limited to the exact Twitch group; we do not pretend the host has gained
+// an entitlement or alter other group lookups.
+static NSURL *MGVirtualizedAppGroupURL(NSString *identifier) {
+    if (![identifier isEqualToString:@"group.twitch.SharedAppResources"]) return nil;
+    static NSURL *url;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSFileManager *fm = NSFileManager.defaultManager;
+        NSURL *support = [fm URLsForDirectory:NSApplicationSupportDirectory
+                                    inDomains:NSUserDomainMask].firstObject;
+        if (!support) {
+            MGLOG(@"virtual app group    cannot resolve Application Support directory");
+            return;
+        }
+        url = [[support URLByAppendingPathComponent:@"MG/AppGroups" isDirectory:YES]
+               URLByAppendingPathComponent:identifier isDirectory:YES];
+        NSError *error = nil;
+        if (![fm createDirectoryAtURL:url withIntermediateDirectories:YES attributes:nil error:&error] &&
+            ![fm fileExistsAtPath:url.path]) {
+            MGLOG(@"virtual app group    create failed path=%@ error=%@", url.path, error);
+            url = nil;
+            return;
+        }
+        MGLOG(@"virtual app group    persistent directory ready: %@", url.path);
+    });
+    return url;
+}
+
+static NSURL *MGScopedContainerURL(id self, SEL cmd, NSString *identifier) {
+    // Async Twitch work may run on threads without the main-bundle scope. Match only the exact
+    // guest group ID so its requests are consistently virtualized across queues.
+    NSURL *virtual = MGVirtualizedAppGroupURL(identifier);
+    if (virtual) {
+        static dispatch_once_t logged;
+        dispatch_once(&logged, ^{
+            MGLOG(@"virtual app group    %@ -> %@", identifier, virtual.path);
+        });
+        return virtual;
+    }
+    if (gOriginalContainerURLIMP) {
+        return ((NSURL *(*)(id, SEL, NSString *))gOriginalContainerURLIMP)(self, cmd, identifier);
+    }
+    return nil;
+}
+
+static NSString *MGVirtualDefaultsSuite(NSString *suiteName) {
+    if ([suiteName isEqualToString:@"group.twitch.SharedAppResources"]) {
+        return @"com.google.ios.youtube.MG.virtual.group.twitch.SharedAppResources";
+    }
+    return suiteName;
+}
+
+static id MGInitWithVirtualGroupSuite(id self, SEL cmd, NSString *suiteName) {
+    NSString *mappedSuite = MGVirtualDefaultsSuite(suiteName);
+    if (suiteName && ![mappedSuite isEqualToString:suiteName]) {
+        MGLOG(@"virtual defaults     suite %@ -> %@", suiteName, mappedSuite);
+    }
+    IMP original = gOriginalInitWithSuiteIMP;
+    return original ? ((id (*)(id, SEL, NSString *))original)(self, cmd, mappedSuite) : nil;
+}
+
+static BOOL MGInstallAppGroupVirtualization(void) {
+    static dispatch_once_t once;
+    static BOOL installed = NO;
+    dispatch_once(&once, ^{
+        Method containerMethod = class_getInstanceMethod(
+            [NSFileManager class], @selector(containerURLForSecurityApplicationGroupIdentifier:));
+        if (containerMethod) {
+            gOriginalContainerURLIMP = method_setImplementation(containerMethod, (IMP)MGScopedContainerURL);
+        }
+        Method defaultsMethod = class_getInstanceMethod([NSUserDefaults class], @selector(initWithSuiteName:));
+        if (defaultsMethod) {
+            gOriginalInitWithSuiteIMP = method_setImplementation(defaultsMethod, (IMP)MGInitWithVirtualGroupSuite);
+        }
+        installed = (gOriginalContainerURLIMP != NULL);
+        MGLOG(@"App Group virtualization container=%@ defaults=%@",
+              gOriginalContainerURLIMP ? @"installed" : @"FAILED",
+              gOriginalInitWithSuiteIMP ? @"installed" : @"unavailable");
+    });
+    return installed;
+}
+
 // SharePlay's setUpSharePlay requires Twitch's unavailable App Group. Add a narrow shim to the host
 // delegate only if it does not already respond. The method does nothing only while the guest scene
 // callback's thread-local opt-out flag is active.
@@ -444,10 +531,10 @@ static BOOL MGInstallHostSceneOptionsCapture(void) {
 static BOOL AttemptGuestAppDelegateLaunch(void) {
     if (gGuestAppDelegate) return YES;
     MGLOG(@"guest launch callback   entering");
-    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-appdelegate-in-progress-r13"];
+    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-appdelegate-in-progress-r14"];
     NSFileManager *fm = NSFileManager.defaultManager;
     if ([fm fileExistsAtPath:attempted]) {
-        MGLOG(@"guest launch callback  skipped (round-13 prior attempt did not finish; marker retained)");
+        MGLOG(@"guest launch callback  skipped (round-14 prior attempt did not finish; marker retained)");
         return NO;
     }
 
@@ -579,10 +666,10 @@ static BOOL AttemptGuestSceneConnect(void) {
         return NO;
     }
 
-    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-scene-in-progress-r13"];
+    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-scene-in-progress-r14"];
     NSFileManager *fm = NSFileManager.defaultManager;
     if ([fm fileExistsAtPath:attempted]) {
-        MGLOG(@"guest scene callback   skipped (round-13 marker remains from an incomplete attempt)");
+        MGLOG(@"guest scene callback   skipped (round-14 marker remains from an incomplete attempt)");
         return NO;
     }
 
@@ -730,8 +817,15 @@ static void DescribeGuestAppGroup(void) {
         return;
     }
     @try {
+        NSURL *nativeURL = nil;
+        if (gOriginalContainerURLIMP) {
+            nativeURL = ((NSURL *(*)(id, SEL, NSString *))gOriginalContainerURLIMP)(
+                NSFileManager.defaultManager,
+                @selector(containerURLForSecurityApplicationGroupIdentifier:), groupName);
+        }
+        MGLOG(@"guest app-group native %@ container=%@", groupName, nativeURL.path ?: @"<nil>");
         NSURL *url = [NSFileManager.defaultManager containerURLForSecurityApplicationGroupIdentifier:groupName];
-        MGLOG(@"guest app-group        %@ container=%@", groupName, url.path ?: @"<nil>");
+        MGLOG(@"guest app-group virtual %@ container=%@", groupName, url.path ?: @"<nil>");
     } @catch (NSException *e) {
         MGLOG(@"guest app-group        %@ lookup raised %@: %@", groupName, e.name, e.reason);
     }
@@ -816,7 +910,7 @@ static void AttemptLoad(void) {
 static void MGAutoProbe(void) {
     // Round 13 disables automatic probing. The round-12 probe and manual LOAD could overlap; make
     // LOAD the only trigger and keep this function as a documented no-op for compatibility.
-    MGLOG(@"auto probe            disabled in round 13; tap LOAD once for a single controlled attempt");
+    MGLOG(@"auto probe            disabled in round 14; tap LOAD once for a single controlled attempt");
 }
 
 // --------------------------------------------------------------------------- //
@@ -969,16 +1063,21 @@ static UIButton *MGButton(NSString *title, UIColor *bg, UIColor *fg) {
 // Named doLoad, not load: -[UIViewController load] is called by UIKit the first time the view is
 // touched, so overriding it would fire the experiment at launch.
 - (void)doLoad {
-    if (gLoadInProgress) {
+    [gLoadLock lock];
+    BOOL alreadyLoading = gLoadInProgress;
+    if (!alreadyLoading) gLoadInProgress = YES;
+    [gLoadLock unlock];
+    if (alreadyLoading) {
         self.status.text = @"load already in progress; wait for it to finish";
         return;
     }
-    gLoadInProgress = YES;
     self.status.text = @"loading, this can take a few seconds ...";
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         AttemptLoad();
         MGFlush();
+        [gLoadLock lock];
         gLoadInProgress = NO;
+        [gLoadLock unlock];
         dispatch_async(dispatch_get_main_queue(), ^{ [self refresh]; });
     });
 }
@@ -1105,6 +1204,7 @@ static UIButton *MGButton(NSString *title, UIColor *bg, UIColor *fg) {
 __attribute__((constructor))
 static void MGLoaderStart(void) {
     gLock = [NSLock new];
+    gLoadLock = [NSLock new];
     gLines = [NSMutableArray array];
 
     NSString *docs = MGDocuments();
@@ -1123,6 +1223,9 @@ static void MGLoaderStart(void) {
         [[NSFileManager defaultManager] copyItemAtPath:gLogPath toPath:previous error:NULL];
     }
     MGLOG(@"MGLoader %s  %@ %@", kRound, @__DATE__, @__TIME__);
+    BOOL appGroupVirtualizationReady = MGInstallAppGroupVirtualization();
+    MGLOG(@"app group virtualization %@",
+          appGroupVirtualizationReady ? @"ready" : @"container hook failed");
     BOOL sceneCaptureReady = MGInstallHostSceneOptionsCapture();
     MGLOG(@"host scene options hook %@", sceneCaptureReady ? @"installed" : @"not installed (scene callback unavailable)");
     MGLOG(@"os                    %@", UIDevice.currentDevice.systemVersion);
@@ -1165,5 +1268,6 @@ static void MGLoaderStart(void) {
         MGFlush();
     });
 
-    MGFlush(); // auto probe disabled in round 13
+    MGLOG(@"auto probe            disabled in round 14; tap LOAD once for a controlled attempt");
+    MGFlush();
 }
