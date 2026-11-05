@@ -1,5 +1,5 @@
-// MGLoader - Option A guest loader (round 12: skip only Twitch SharePlay setup and keep the host
-// UIApplication delegate installed during the guest scene callback).
+// MGLoader - Option A guest loader (round 13: single-flight LOAD, preserved per-run log, and
+// checkpoints around the SharePlay shim and guest scene callback).
 //
 // Round 1 proved injection but its overlay was unusable: expanding the window moved the hard-coded
 // buttons to y=4, i.e. behind the clock, and they could not be tapped. Round 2 fixes that three ways:
@@ -25,10 +25,12 @@
 // TWWindow/Twitch.RootViewController, but later backgrounding crashed. Round 10 pinned YTAppDelegate,
 // but scene initialization still trapped and UIKit state restoration remained unstable. Round 11
 // confirmed the host lacks Twitch's app-group entitlement and the group's container URL is nil.
-// Round 12 honors the SharePlay compromise: add a narrow setUpSharePlay shim to YTAppDelegate and
-// make it a no-op only while Twitch's guest scene callback is active. The existing UIApplication
-// delegate stays installed. All other guest startup remains enabled, so additional app-group
-// dependencies may still fail. No UIApplicationMain, fake scene/options objects, or delegate swap.
+// Round 12 showed the SharePlay skip alone did not stabilize scene startup; its top seven Twitch
+// frames matched the r10 scene trap. Round 13 keeps the r12 behavior, but adds diagnostics only:
+// 1. LOAD becomes single-flight and manual-only, so an automatic probe cannot race a tapped LOAD.
+// 2. The previous run's mgloader.txt is preserved as mgloader.previous.txt before truncation.
+// 3. Checkpoints log shim installation/invocation and every guest scene callback stage.
+// No UIApplicationMain, fabricated scene/options, or UIApplication.delegate swap.
 //
 // Build: see build.sh (clang + iPhoneOS SDK, no Theos). Install name @rpath/MGLoader.dylib.
 
@@ -43,7 +45,7 @@
 #import <arpa/inet.h>
 #include <string.h>
 
-static const char *kRound = "round 12";
+static const char *kRound = "round 13";
 
 static NSMutableArray<NSString *> *gLines;
 static NSLock *gLock;
@@ -54,6 +56,7 @@ static NSString *gLastLoad = @"not run";
 static IMP gOriginalMainBundleIMP;
 static NSString * const kGuestMainBundleThreadKey = @"MGLoader.ThreadGuestMainBundle";
 static NSString * const kGuestSharePlaySkipThreadKey = @"MGLoader.SkipGuestSharePlay";
+static BOOL gLoadInProgress = NO;
 static id gGuestAppDelegate;
 static id gGuestSceneDelegate;
 static UIScene *gHostConnectedScene;
@@ -378,7 +381,7 @@ static BOOL MGInstallMainBundleScope(void) {
 // callback's thread-local opt-out flag is active.
 static void MGSkipGuestSharePlay(id self, SEL cmd) {
     if ([NSThread.currentThread.threadDictionary[kGuestSharePlaySkipThreadKey] boolValue]) {
-        MGLOG(@"guest SharePlay setup skipped (app-group entitlement unavailable)");
+        MGLOG(@"guest SharePlay shim    invoked; no-op for this guest scene callback");
     } else {
         MGLOG(@"guest SharePlay shim    call outside guest scene callback; preserving unrecognized-selector behavior");
         [self doesNotRecognizeSelector:cmd];
@@ -440,10 +443,11 @@ static BOOL MGInstallHostSceneOptionsCapture(void) {
 // successful initialization keeps the instance alive for the following scene callback.
 static BOOL AttemptGuestAppDelegateLaunch(void) {
     if (gGuestAppDelegate) return YES;
-    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-appdelegate-in-progress-r12"];
+    MGLOG(@"guest launch callback   entering");
+    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-appdelegate-in-progress-r13"];
     NSFileManager *fm = NSFileManager.defaultManager;
     if ([fm fileExistsAtPath:attempted]) {
-        MGLOG(@"guest launch callback  skipped (round-12 prior attempt did not finish; marker retained)");
+        MGLOG(@"guest launch callback  skipped (round-13 prior attempt did not finish; marker retained)");
         return NO;
     }
 
@@ -541,6 +545,7 @@ static BOOL AttemptGuestAppDelegateLaunch(void) {
 }
 
 static BOOL AttemptGuestSceneConnect(void) {
+    MGLOG(@"guest scene callback   entering");
     if (gGuestSceneDelegate) {
         MGLOG(@"guest scene callback   skipped (scene delegate already connected in this process)");
         return YES;
@@ -574,10 +579,10 @@ static BOOL AttemptGuestSceneConnect(void) {
         return NO;
     }
 
-    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-scene-in-progress-r12"];
+    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-scene-in-progress-r13"];
     NSFileManager *fm = NSFileManager.defaultManager;
     if ([fm fileExistsAtPath:attempted]) {
-        MGLOG(@"guest scene callback   skipped (round-12 marker remains from an incomplete attempt)");
+        MGLOG(@"guest scene callback   skipped (round-13 marker remains from an incomplete attempt)");
         return NO;
     }
 
@@ -609,6 +614,7 @@ static BOOL AttemptGuestSceneConnect(void) {
     // a crash; remove it only after the callback returns normally.
     [@"Twitch.SceneDelegate willConnect in progress with captured host options\n"
         writeToFile:attempted atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+    MGLOG(@"guest scene callback   marker written");
     __block BOOL connected = NO;
     dispatch_block_t connect = ^{
         UIScene *scene = gHostConnectedScene;
@@ -651,6 +657,7 @@ static BOOL AttemptGuestSceneConnect(void) {
                 return;
             }
 
+            MGLOG(@"guest scene callback   allocating Twitch.SceneDelegate");
             id instance = [[cls alloc] init];
             if (!instance) {
                 MGLOG(@"guest scene callback   SceneDelegate init returned nil");
@@ -666,8 +673,10 @@ static BOOL AttemptGuestSceneConnect(void) {
             id<UISceneDelegate> delegate = (id<UISceneDelegate>)instance;
             MGLOG(@"guest scene handoff    UIApplication.delegate remains %@",
                   RuntimeObjectName(app.delegate));
+            MGLOG(@"guest scene callback   calling willConnect");
             threadDictionary[kGuestSharePlaySkipThreadKey] = @YES;
             [delegate scene:scene willConnectToSession:session options:options];
+            MGLOG(@"guest scene callback   willConnect returned");
             connected = YES;
 
             id appDelegateAfter = app.delegate;
@@ -789,31 +798,26 @@ static void AttemptLoad(void) {
     MGLOG(@"guest class Swift SceneDelegate %@", DescribeRuntimeClass(@"_TtC6Twitch13SceneDelegate"));
     MGLOG(@"guest class RCTAppDependencyProvider %@", DescribeRuntimeClass(@"RCTAppDependencyProvider"));
     DescribeGuestAppGroup();
-
+ 
     // Keep the diagnostic first. Then exercise the existing guest lifecycle callbacks with fresh
-    // r12 sentinels; never call the executable entry point or UIApplicationMain.
+    // r13 sentinels; never call the executable entry point or UIApplicationMain.
+    MGLOG(@"guest lifecycle callbacks starting");
     BOOL launched = AttemptGuestAppDelegateLaunch();
     MGLOG(@"guest launch callback  %@", launched ? @"returned successfully" : @"not completed");
     if (launched) {
         BOOL connected = AttemptGuestSceneConnect();
         MGLOG(@"guest scene callback   %@", connected ? @"returned successfully" : @"not completed/skipped");
     }
+    MGLOG(@"guest lifecycle callbacks finished");
 }
 
 // One automatic probe, guarded by a sentinel so a guest that crashes the process can only do it
 // once. The sentinel lives in Documents because the container survives launches, not installs.
 static void MGAutoProbe(void) {
-    // Versioned so earlier crash markers remain as evidence but do not suppress this test.
-    NSString *sentinel = [MGDocuments() stringByAppendingPathComponent:@"MG/dlopen-in-progress-r12"];
-    NSFileManager *fm = NSFileManager.defaultManager;
-
-    MGLOG(@"auto probe            start");
-    if ([fm fileExistsAtPath:sentinel]) {
-        gLastLoad = @"skipped (previous crash)";
-        MGLOG(@"auto probe            previous auto dlopen never returned; skipping");
-        MGLOG(@"auto probe            round-12 sentinel present; inspect crash log before retrying");
-        return;
-    }
+    // Round 13 disables automatic probing. The round-12 probe and manual LOAD could overlap; make
+    // LOAD the only trigger and keep this function as a documented no-op for compatibility.
+    MGLOG(@"auto probe            disabled in round 13; tap LOAD for one controlled attempt");
+    return;
     if (![fm fileExistsAtPath:GuestExec()]) {
         gLastLoad = @"guest absent";
         MGLOG(@"auto probe            guest absent, nothing to load");
@@ -983,10 +987,16 @@ static UIButton *MGButton(NSString *title, UIColor *bg, UIColor *fg) {
 // Named doLoad, not load: -[UIViewController load] is called by UIKit the first time the view is
 // touched, so overriding it would fire the experiment at launch.
 - (void)doLoad {
+    if (gLoadInProgress) {
+        self.status.text = @"load already in progress; wait for it to finish";
+        return;
+    }
+    gLoadInProgress = YES;
     self.status.text = @"loading, this can take a few seconds ...";
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         AttemptLoad();
         MGFlush();
+        gLoadInProgress = NO;
         dispatch_async(dispatch_get_main_queue(), ^{ [self refresh]; });
     });
 }
@@ -1123,6 +1133,13 @@ static void MGLoaderStart(void) {
                                                            inDomains:NSUserDomainMask].firstObject;
     gMirrorPath = [[caches URLByAppendingPathComponent:@"mgloader.txt"] path];
 
+    // Preserve the previous run's log across launches so a crash run is not overwritten.
+    if ([[NSFileManager defaultManager] fileExistsAtPath:gLogPath]) {
+        NSString *previous = [[gLogPath stringByDeletingLastPathComponent]
+                              stringByAppendingPathComponent:@"mgloader.previous.txt"];
+        [[NSFileManager defaultManager] removeItemAtPath:previous error:NULL];
+        [[NSFileManager defaultManager] copyItemAtPath:gLogPath toPath:previous error:NULL];
+    }
     MGLOG(@"MGLoader %s  %@ %@", kRound, @__DATE__, @__TIME__);
     BOOL sceneCaptureReady = MGInstallHostSceneOptionsCapture();
     MGLOG(@"host scene options hook %@", sceneCaptureReady ? @"installed" : @"not installed (scene callback unavailable)");
@@ -1166,6 +1183,5 @@ static void MGLoaderStart(void) {
         MGFlush();
     });
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ MGAutoProbe(); });
+    MGFlush(); // auto probe disabled in round 13
 }
