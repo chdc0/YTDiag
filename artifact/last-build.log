@@ -1,0 +1,39 @@
+Xcode 26.6
+Build version 17F113
+SDK:  /Applications/Xcode_26.6.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS26.5.sdk
+Xcode: Xcode 26.6
+compiling MGLoader.dylib ...
+Sources/MGLoader.m:468:40: warning: 'windows' is deprecated: first deprecated in iOS 15.0 - Use UIWindowScene.windows on a relevant window scene instead [-Wdeprecated-declarations]
+  468 |         NSUInteger windowsBefore = app.windows.count;
+      |                                        ^
+/Applications/Xcode_26.6.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS26.5.sdk/System/Library/Frameworks/UIKit.framework/Headers/UIApplication.h:109:62: note: 'windows' has been explicitly marked deprecated here
+  109 | @property(nonatomic,readonly) NSArray<__kindof UIWindow *>  *windows API_DEPRECATED("Use UIWindowScene.windows on a relevant window scene instead", ios(2.0, 15.0), visionos(1.0, 1.0)) API_UNAVAILABLE(watchos);
+      |                                                              ^
+Sources/MGLoader.m:523:38: warning: 'windows' is deprecated: first deprecated in iOS 15.0 - Use UIWindowScene.windows on a relevant window scene instead [-Wdeprecated-declarations]
+  523 |                   (unsigned long)app.windows.count, (unsigned long)app.connectedScenes.count,
+      |                                      ^
+/Applications/Xcode_26.6.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS26.5.sdk/System/Library/Frameworks/UIKit.framework/Headers/UIApplication.h:109:62: note: 'windows' has been explicitly marked deprecated here
+  109 | @property(nonatomic,readonly) NSArray<__kindof UIWindow *>  *windows API_DEPRECATED("Use UIWindowScene.windows on a relevant window scene instead", ios(2.0, 15.0), visionos(1.0, 1.0)) API_UNAVAILABLE(watchos);
+      |                                                              ^
+Sources/MGLoader.m:631:40: warning: 'windows' is deprecated: first deprecated in iOS 15.0 - Use UIWindowScene.windows on a relevant window scene instead [-Wdeprecated-declarations]
+  631 |         NSUInteger windowsBefore = app.windows.count;
+      |                                        ^
+/Applications/Xcode_26.6.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS26.5.sdk/System/Library/Frameworks/UIKit.framework/Headers/UIApplication.h:109:62: note: 'windows' has been explicitly marked deprecated here
+  109 | @property(nonatomic,readonly) NSArray<__kindof UIWindow *>  *windows API_DEPRECATED("Use UIWindowScene.windows on a relevant window scene instead", ios(2.0, 15.0), visionos(1.0, 1.0)) API_UNAVAILABLE(watchos);
+      |                                                              ^
+Sources/MGLoader.m:688:38: warning: 'windows' is deprecated: first deprecated in iOS 15.0 - Use UIWindowScene.windows on a relevant window scene instead [-Wdeprecated-declarations]
+  688 |                   (unsigned long)app.windows.count, (unsigned long)windowScene.windows.count,
+      |                                      ^
+/Applications/Xcode_26.6.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS26.5.sdk/System/Library/Frameworks/UIKit.framework/Headers/UIApplication.h:109:62: note: 'windows' has been explicitly marked deprecated here
+  109 | @property(nonatomic,readonly) NSArray<__kindof UIWindow *>  *windows API_DEPRECATED("Use UIWindowScene.windows on a relevant window scene instead", ios(2.0, 15.0), visionos(1.0, 1.0)) API_UNAVAILABLE(watchos);
+      |                                                              ^
+Sources/MGLoader.m:821:11: error: use of undeclared identifier 'fm'
+  821 |     if (![fm fileExistsAtPath:GuestExec()]) {
+      |           ^~
+Sources/MGLoader.m:827:62: error: use of undeclared identifier 'sentinel'
+  827 |     [@"round-12 guest scene probe in progress\n" writeToFile:sentinel atomically:YES
+      |                                                              ^~~~~~~~
+Sources/MGLoader.m:834:58: error: use of undeclared identifier 'sentinel'
+  834 |         [[NSFileManager defaultManager] removeItemAtPath:sentinel error:NULL];
+      |                                                          ^~~~~~~~
+4 warnings and 3 errors generated.
