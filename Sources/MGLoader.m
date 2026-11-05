@@ -1,5 +1,5 @@
-// MGLoader - Option A guest loader (round 6: one guarded guest app-delegate launch callback, without
-// replacing the host delegate or creating a guest window).
+// MGLoader - Option A guest loader (round 7: scope NSBundle.mainBundle to the Twitch bundle only
+// while the guarded guest app-delegate launch callback runs).
 //
 // Round 1 proved injection but its overlay was unusable: expanding the window moved the hard-coded
 // buttons to y=4, i.e. behind the clock, and they could not be tapped. Round 2 fixes that three ways:
@@ -16,13 +16,15 @@
 // behind a sentinel, and nothing is loaded when the guest is absent.
 //
 // Round 3 proved SideStore signs the mode-B guest. Round 4 proved RTLD_LAZY defers an unresolved
-// Reanimated constructor (it does not supply it). Round 5 found TWAppDelegate, Twitch.SceneDelegate,
-// and RCTAppDependencyProvider. Round 6 allocates TWAppDelegate once per install and invokes only
-// application:didFinishLaunchingWithOptions: on the main thread, passing the existing UIApplication
-// and nil launch options. It does NOT replace UIApplication.delegate, call UIApplicationMain, invoke
-// the scene delegate, or create a guest window. A persistent attempt marker prevents a second
-// callback even if LOAD is tapped again; the existing automatic-probe sentinel remains the
-// crash-loop guard. We log host delegate/window/scene state before and after the callback.
+// Reanimated constructor (it does not supply it). Round 5 found the guest's delegate/factory classes.
+// Round 6 crashed inside TWAppDelegate.application:didFinishLaunchingWithOptions:: the Twitch code
+// reads TWAppGroupName from Bundle.main, but this process still reports the YouTube bundle. Round 7
+// installs a class-method wrapper for +[NSBundle mainBundle] that consults a thread-dictionary
+// override. On the main thread only, the override points to Twitch.app during TWAppDelegate alloc,
+// init, and launch callback; finally it is restored, leaving the host bundle unchanged. We do NOT
+// mutate YouTube's Info.plist, assign UIApplication.delegate, call UIApplicationMain, invoke the
+// scene delegate, or create a guest window. New r7 sentinels preserve old crash evidence while
+// allowing exactly one new test attempt.
 //
 // Build: see build.sh (clang + iPhoneOS SDK, no Theos). Install name @rpath/MGLoader.dylib.
 
@@ -37,7 +39,7 @@
 #import <arpa/inet.h>
 #include <string.h>
 
-static const char *kRound = "round 6";
+static const char *kRound = "round 7";
 
 static NSMutableArray<NSString *> *gLines;
 static NSLock *gLock;
@@ -45,6 +47,8 @@ static NSString *gLogPath;          // Documents/mgloader.txt (Files app visible
 static NSString *gMirrorPath;       // Library/Caches/mgloader.txt (kept for compatibility)
 static void (^gOnLog)(void);        // set by the panel; called on the main queue
 static NSString *gLastLoad = @"not run";
+static IMP gOriginalMainBundleIMP;
+static NSString * const kGuestMainBundleThreadKey = @"MGLoader.ThreadGuestMainBundle";
 
 // --------------------------------------------------------------------------- //
 // logging
@@ -335,19 +339,41 @@ static NSString *RuntimeObjectName(id object) {
     return object ? NSStringFromClass([object class]) : @"nil";
 }
 
+// NSBundle.mainBundle is process-global by default. During the guest lifecycle callback only, let
+// calls on the current thread see Twitch.app; every other thread and all calls after the callback
+// continue to see the original YouTube bundle.
+static NSBundle *MGScopedMainBundle(id self, SEL cmd) {
+    NSBundle *scoped = NSThread.currentThread.threadDictionary[kGuestMainBundleThreadKey];
+    if (scoped) return scoped;
+    IMP original = gOriginalMainBundleIMP;
+    return original ? ((NSBundle *(*)(id, SEL))original)(self, cmd) : nil;
+}
+
+static BOOL MGInstallMainBundleScope(void) {
+    static dispatch_once_t once;
+    static BOOL installed = NO;
+    dispatch_once(&once, ^{
+        Method method = class_getClassMethod([NSBundle class], @selector(mainBundle));
+        if (!method) return;
+        gOriginalMainBundleIMP = method_setImplementation(method, (IMP)MGScopedMainBundle);
+        installed = (gOriginalMainBundleIMP != NULL);
+    });
+    return installed;
+}
+
 // One-shot, guarded app-delegate callback. This is the first active guest bootstrap touch: it may
 // initialize Twitch/Expo process-wide services, so do not also attach a scene or show a window here.
 static void AttemptGuestAppDelegateLaunch(void) {
-    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-appdelegate-attempted"];
+    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-appdelegate-attempted-bundle-r7"];
     NSFileManager *fm = NSFileManager.defaultManager;
     if ([fm fileExistsAtPath:attempted]) {
-        MGLOG(@"guest launch callback  skipped (already attempted; delete Documents/MG/guest-appdelegate-attempted to retry)");
+        MGLOG(@"guest launch callback  skipped (round-7 bundle callback already attempted)");
         return;
     }
 
-    // Write before class realization/init/callback: any crash leaves a clear, persistent one-shot
-    // marker, in addition to the automatic dlopen sentinel.
-    [@"TWAppDelegate launch callback attempted\n" writeToFile:attempted atomically:YES
+    // Write before class realization/init/callback: any crash leaves a clear, persistent round-7
+    // marker, in addition to the versioned automatic dlopen sentinel.
+    [@"TWAppDelegate launch callback attempted with guest main bundle\n" writeToFile:attempted atomically:YES
                                                       encoding:NSUTF8StringEncoding error:NULL];
     dispatch_block_t invoke = ^{
         Class cls = NSClassFromString(@"TWAppDelegate");
@@ -360,11 +386,41 @@ static void AttemptGuestAppDelegateLaunch(void) {
         id hostDelegateBefore = app.delegate;
         NSUInteger windowsBefore = app.windows.count;
         NSUInteger scenesBefore = app.connectedScenes.count;
+        NSBundle *hostBundleBefore = NSBundle.mainBundle;
         MGLOG(@"guest callback before  appDelegate=%@ windows=%lu scenes=%lu state=%ld",
               RuntimeObjectName(hostDelegateBefore), (unsigned long)windowsBefore,
               (unsigned long)scenesBefore, (long)app.applicationState);
 
+        NSString *guestBundlePath = [[GuestRoot() stringByAppendingPathComponent:@"Twitch.app"]
+                                     stringByStandardizingPath];
+        NSBundle *guestBundle = [NSBundle bundleWithPath:guestBundlePath];
+        if (!guestBundle) {
+            MGLOG(@"guest main bundle     could not create NSBundle at %@", guestBundlePath);
+            return;
+        }
+        if (!MGInstallMainBundleScope()) {
+            MGLOG(@"guest main bundle     could not install scoped +[NSBundle mainBundle] wrapper");
+            return;
+        }
+
+        NSMutableDictionary *threadDictionary = NSThread.currentThread.threadDictionary;
+        id priorScopedBundle = threadDictionary[kGuestMainBundleThreadKey];
+        threadDictionary[kGuestMainBundleThreadKey] = guestBundle;
         @try {
+            NSBundle *observedMainBundle = NSBundle.mainBundle;
+            id groupName = [observedMainBundle objectForInfoDictionaryKey:@"TWAppGroupName"];
+            MGLOG(@"guest main bundle     original=%@ scoped=%@ TWAppGroupName=%@",
+                  hostBundleBefore.bundlePath, observedMainBundle.bundlePath,
+                  groupName ?: @"<absent>");
+            if (![observedMainBundle.bundlePath isEqualToString:guestBundle.bundlePath]) {
+                MGLOG(@"guest launch callback  scoped main bundle did not take effect; callback not called");
+                return;
+            }
+            if (![groupName isKindOfClass:[NSString class]] || [groupName length] == 0) {
+                MGLOG(@"guest launch callback  guest Info.plist has no TWAppGroupName; callback not called");
+                return;
+            }
+
             id instance = [[cls alloc] init];
             if (!instance) {
                 MGLOG(@"guest launch callback  TWAppDelegate init returned nil");
@@ -387,6 +443,11 @@ static void AttemptGuestAppDelegateLaunch(void) {
                   (long)app.applicationState);
         } @catch (NSException *e) {
             MGLOG(@"guest launch callback  raised %@: %@", e.name, e.reason);
+        } @finally {
+            if (priorScopedBundle) threadDictionary[kGuestMainBundleThreadKey] = priorScopedBundle;
+            else [threadDictionary removeObjectForKey:kGuestMainBundleThreadKey];
+            MGLOG(@"host main bundle restored %@ expected=%@",
+                  NSBundle.mainBundle.bundlePath, hostBundleBefore.bundlePath);
         }
     };
 
@@ -464,14 +525,15 @@ static void AttemptLoad(void) {
 // One automatic probe, guarded by a sentinel so a guest that crashes the process can only do it
 // once. The sentinel lives in Documents because the container survives launches, not installs.
 static void MGAutoProbe(void) {
-    NSString *sentinel = [MGDocuments() stringByAppendingPathComponent:@"MG/dlopen-in-progress"];
+    // Versioned so the round-6 crash marker remains as evidence but does not suppress this new test.
+    NSString *sentinel = [MGDocuments() stringByAppendingPathComponent:@"MG/dlopen-in-progress-r7"];
     NSFileManager *fm = NSFileManager.defaultManager;
 
     MGLOG(@"auto probe            start");
     if ([fm fileExistsAtPath:sentinel]) {
         gLastLoad = @"skipped (previous crash)";
         MGLOG(@"auto probe            previous auto dlopen never returned; skipping");
-        MGLOG(@"auto probe            delete Documents/MG/dlopen-in-progress to retry, or tap LOAD");
+        MGLOG(@"auto probe            round-7 sentinel present; inspect crash log before retrying");
         return;
     }
     if (![fm fileExistsAtPath:GuestExec()]) {
@@ -480,7 +542,7 @@ static void MGAutoProbe(void) {
         return;
     }
 
-    [@"auto dlopen in progress\n" writeToFile:sentinel atomically:YES
+    [@"round-7 auto dlopen in progress\n" writeToFile:sentinel atomically:YES
                                      encoding:NSUTF8StringEncoding error:NULL];
     MGLOG(@"auto probe            guest present; log flushed, dlopen next");
     MGFlush();
