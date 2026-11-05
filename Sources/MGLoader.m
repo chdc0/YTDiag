@@ -1,5 +1,6 @@
-// MGLoader - Option A guest loader (round 15: virtualize Twitch's App Group and forward the one
-// confirmed Twitch-only app-delegate getter, chromecastManager, without swapping UIApplication.delegate).
+// MGLoader - Option A guest loader (round 16: preserve native App Group storage when available,
+// virtualize only when missing, and forward Twitch's chromecastManager getter without swapping
+// UIApplication.delegate).
 //
 // Round 1 proved injection but its overlay was unusable: expanding the window moved the hard-coded
 // buttons to y=4, i.e. behind the clock, and they could not be tapped. Round 2 fixes that three ways:
@@ -28,10 +29,11 @@
 // LiveContainer's r13 log proved the exact scene callback can return when Twitch's group container
 // is resolvable. It also showed 128 LiveContainer keychain groups, while SideStore has no keychain
 // groups, so round 14 virtualized the exact Twitch group container and NSUserDefaults suite into
-// YouTube's sandbox; the scene still returned under LiveContainer. Post-login playback then asked
-// YTAppDelegate for chromecastManager, which it lacks. Static inspection confirms TWAppDelegate
-// implements chromecastManager with an object return. Round 15 forwards only that selector to the
-// retained TWAppDelegate under Twitch's NSBundle.mainBundle scope. Keychain remains untouched.
+// YouTube's sandbox; the scene still returned under LiveContainer. Round 16 preserves a native
+// LiveContainer group/defaults suite when available and falls back to YouTube-owned virtual storage
+// only when the OS lookup is nil. Post-login playback asks YTAppDelegate for chromecastManager, which
+// it lacks. Static inspection confirms TWAppDelegate implements it with an object return; forward
+// only that selector to the retained guest under Twitch's main-bundle scope. Keychain remains untouched.
 // LOAD stays manual-only/single-flight; previous logs are preserved and checkpoints remain enabled.
 // No entitlement is forged, no guest tree is re-signed here, and no UIApplicationMain or delegate
 // swap is used.
@@ -49,7 +51,7 @@
 #import <arpa/inet.h>
 #include <string.h>
 
-static const char *kRound = "round 15";
+static const char *kRound = "round 16";
 
 static NSMutableArray<NSString *> *gLines;
 static NSLock *gLock;
@@ -417,7 +419,18 @@ static NSURL *MGVirtualizedAppGroupURL(NSString *identifier) {
 
 static NSURL *MGScopedContainerURL(id self, SEL cmd, NSString *identifier) {
     // Async Twitch work may run on threads without the main-bundle scope. Match only the exact
-    // guest group ID so its requests are consistently virtualized across queues.
+    // guest group ID. Preserve LiveContainer's native virtual container if available; synthesize a
+    // local one only when the original iOS lookup returns nil (the SideStore case).
+    if ([identifier isEqualToString:@"group.twitch.SharedAppResources"] && gOriginalContainerURLIMP) {
+        NSURL *native = ((NSURL *(*)(id, SEL, NSString *))gOriginalContainerURLIMP)(self, cmd, identifier);
+        if (native) {
+            static dispatch_once_t loggedNative;
+            dispatch_once(&loggedNative, ^{
+                MGLOG(@"native app group     %@ -> %@ (preserved)", identifier, native.path);
+            });
+            return native;
+        }
+    }
     NSURL *virtual = MGVirtualizedAppGroupURL(identifier);
     if (virtual) {
         static dispatch_once_t logged;
@@ -440,11 +453,20 @@ static NSString *MGVirtualDefaultsSuite(NSString *suiteName) {
 }
 
 static id MGInitWithVirtualGroupSuite(id self, SEL cmd, NSString *suiteName) {
+    IMP original = gOriginalInitWithSuiteIMP;
+    if ([suiteName isEqualToString:@"group.twitch.SharedAppResources"] && gOriginalContainerURLIMP) {
+        NSURL *native = ((NSURL *(*)(id, SEL, NSString *))gOriginalContainerURLIMP)(
+            NSFileManager.defaultManager,
+            @selector(containerURLForSecurityApplicationGroupIdentifier:), suiteName);
+        if (native) {
+            MGLOG(@"native defaults     suite %@ preserved (container=%@)", suiteName, native.path);
+            return original ? ((id (*)(id, SEL, NSString *))original)(self, cmd, suiteName) : nil;
+        }
+    }
     NSString *mappedSuite = MGVirtualDefaultsSuite(suiteName);
     if (suiteName && ![mappedSuite isEqualToString:suiteName]) {
         MGLOG(@"virtual defaults     suite %@ -> %@", suiteName, mappedSuite);
     }
-    IMP original = gOriginalInitWithSuiteIMP;
     return original ? ((id (*)(id, SEL, NSString *))original)(self, cmd, mappedSuite) : nil;
 }
 
@@ -596,10 +618,10 @@ static BOOL MGInstallHostSceneOptionsCapture(void) {
 static BOOL AttemptGuestAppDelegateLaunch(void) {
     if (gGuestAppDelegate) return YES;
     MGLOG(@"guest launch callback   entering");
-    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-appdelegate-in-progress-r15"];
+    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-appdelegate-in-progress-r16"];
     NSFileManager *fm = NSFileManager.defaultManager;
     if ([fm fileExistsAtPath:attempted]) {
-        MGLOG(@"guest launch callback  skipped (round-15 prior attempt did not finish; marker retained)");
+        MGLOG(@"guest launch callback  skipped (round-16 prior attempt did not finish; marker retained)");
         return NO;
     }
 
@@ -737,10 +759,10 @@ static BOOL AttemptGuestSceneConnect(void) {
         return NO;
     }
 
-    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-scene-in-progress-r15"];
+    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-scene-in-progress-r16"];
     NSFileManager *fm = NSFileManager.defaultManager;
     if ([fm fileExistsAtPath:attempted]) {
-        MGLOG(@"guest scene callback   skipped (round-15 marker remains from an incomplete attempt)");
+        MGLOG(@"guest scene callback   skipped (round-16 marker remains from an incomplete attempt)");
         return NO;
     }
 
@@ -981,7 +1003,7 @@ static void AttemptLoad(void) {
 static void MGAutoProbe(void) {
     // Round 13 disables automatic probing. The round-12 probe and manual LOAD could overlap; make
     // LOAD the only trigger and keep this function as a documented no-op for compatibility.
-    MGLOG(@"auto probe            disabled in round 15; tap LOAD once for a single controlled attempt");
+    MGLOG(@"auto probe            disabled in round 16; tap LOAD once for a single controlled attempt");
 }
 
 // --------------------------------------------------------------------------- //
@@ -1339,6 +1361,6 @@ static void MGLoaderStart(void) {
         MGFlush();
     });
 
-    MGLOG(@"auto probe            disabled in round 15; tap LOAD once for a controlled attempt");
+    MGLOG(@"auto probe            disabled in round 16; tap LOAD once for a controlled attempt");
     MGFlush();
 }
