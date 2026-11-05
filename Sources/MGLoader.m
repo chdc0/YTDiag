@@ -816,25 +816,7 @@ static void AttemptLoad(void) {
 static void MGAutoProbe(void) {
     // Round 13 disables automatic probing. The round-12 probe and manual LOAD could overlap; make
     // LOAD the only trigger and keep this function as a documented no-op for compatibility.
-    MGLOG(@"auto probe            disabled in round 13; tap LOAD for one controlled attempt");
-    return;
-    if (![fm fileExistsAtPath:GuestExec()]) {
-        gLastLoad = @"guest absent";
-        MGLOG(@"auto probe            guest absent, nothing to load");
-        return;
-    }
-
-    [@"round-12 guest scene probe in progress\n" writeToFile:sentinel atomically:YES
-                                     encoding:NSUTF8StringEncoding error:NULL];
-    MGLOG(@"auto probe            guest present; log flushed, dlopen next");
-    MGFlush();
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
-                   dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        AttemptLoad();
-        [[NSFileManager defaultManager] removeItemAtPath:sentinel error:NULL];
-        MGLOG(@"auto probe            returned normally (process survived the load)");
-        MGFlush();
-    });
+    MGLOG(@"auto probe            disabled in round 13; tap LOAD once for a single controlled attempt");
 }
 
 // --------------------------------------------------------------------------- //
