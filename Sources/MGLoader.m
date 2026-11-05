@@ -1,5 +1,5 @@
-// MGLoader - Option A guest loader (round 3: mode B - the guest ships inside the app bundle, so
-// SideStore signs it with the real certificate; plus a probe that says who signed the guest).
+// MGLoader - Option A guest loader (round 4: test whether deferring one lazy flat-namespace import
+// lets the team-signed mode-B guest finish dlopen).
 //
 // Round 1 proved injection but its overlay was unusable: expanding the window moved the hard-coded
 // buttons to y=4, i.e. behind the clock, and they could not be tapped. Round 2 fixes that three ways:
@@ -15,16 +15,13 @@
 // It must never take the host down permanently: every guest touch is inside @try, the probe runs
 // behind a sentinel, and nothing is loaded when the guest is absent.
 //
-// Round 3 changes only the payload contract. The round-4 device log proved ad-hoc signing is a dead
-// end on iOS 27.2: the guest's blob hashes are valid (errno would be EBADEXEC otherwise) but
-// F_ADDFILESIGS_RETURN answers EPERM, i.e. AMFI policy. LiveContainer stopped bypassing codesign on
-// iOS 26+ for the same reason and now signs guests with the host's certificate. So the guest tree
-// ships at YouTube.app/MG/guests/tv.twitch-31.7/ inside the IPA, SideStore's ldid pass walks the
-// whole .app and re-signs every Mach-O in it, and dlopen gets a team-signed image. The Documents
-// import from mode C still works (and can be forced with Documents/MG/use-documents), but the
-// bundle copy wins by default. The log now also reports the guest's CodeDirectory flags, CMS
-// presence, team id and identifier, so "still ad-hoc" and "signed but something else failed" are
-// distinguishable from the device without another round.
+// Round 3 proved SideStore recursively signs the mode-B guest with the team's certificate. The
+// device's remaining failure is a flat-namespace constructor import in reanimated.framework. An
+// offline bind-opcode scan found it in that image's lazy_bind stream (dynamic lookup ordinal -2),
+// not its ordinary bind stream. Round 4 changes only RTLD_NOW to RTLD_LAZY: if the symbol is not
+// needed during image initializers, dlopen can return and the log will tell us whether this was only
+// eager resolution. It does not provide the missing implementation; calling the dependent path may
+// still fail. The automatic-probe crash sentinel remains in place.
 //
 // Build: see build.sh (clang + iPhoneOS SDK, no Theos). Install name @rpath/MGLoader.dylib.
 
@@ -39,7 +36,7 @@
 #import <arpa/inet.h>
 #include <string.h>
 
-static const char *kRound = "round 3";
+static const char *kRound = "round 4";
 
 static NSMutableArray<NSString *> *gLines;
 static NSLock *gLock;
@@ -309,6 +306,7 @@ static void MGSetChip(NSString *title, UIColor *bg);
 static void AttemptLoad(void) {
     NSString *exe = GuestExec();
     MGLOG(@"--- LOAD ---");
+    MGLOG(@"dlopen mode           RTLD_LAZY | RTLD_LOCAL");
     MGLOG(@"guest                 %@", exe);
     MGLOG(@"header                %@", DescribeMachO(exe));
     MGLOG(@"signature             %@", DescribeSignature(exe));
@@ -335,7 +333,7 @@ static void AttemptLoad(void) {
     CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
     void *h = NULL;
     @try {
-        h = dlopen(exe.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL);
+        h = dlopen(exe.fileSystemRepresentation, RTLD_LAZY | RTLD_LOCAL);
     } @catch (NSException *e) {
         gLastLoad = @"raised";
         MGLOG(@"dlopen raised         %@: %@", e.name, e.reason);
