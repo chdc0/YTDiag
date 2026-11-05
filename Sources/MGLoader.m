@@ -1,5 +1,5 @@
-// MGLoader - Option A guest loader (round 10: pin the host app delegate strongly across the
-// temporary guest-delegate scene handoff).
+// MGLoader - Option A guest loader (round 11: passive app-group entitlement/container diagnostic;
+// no guest lifecycle callbacks).
 //
 // Round 1 proved injection but its overlay was unusable: expanding the window moved the hard-coded
 // buttons to y=4, i.e. behind the clock, and they could not be tapped. Round 2 fixes that three ways:
@@ -21,13 +21,14 @@
 // thread-scoped NSBundle.mainBundle override and confirmed TWAppDelegate returned YES while the
 // host state stayed unchanged. Round 8 captured the host's real UISceneConnectionOptions and
 // reached Twitch.SceneDelegate. That callback asked YTAppDelegate for Twitch-only setUpSharePlay.
-// Round 9 temporarily assigned TWAppDelegate during that callback and created the first
-// TWWindow/Twitch.RootViewController. Two later crashes suggest the original YTAppDelegate may have
-// been deallocated: UIApplication.delegate is assign, and UIKit later sent
-// shouldSaveApplicationState: to an OS_dispatch_source. Round 10 pins the original YTAppDelegate
-// process-wide, restores that exact instance in @finally, and logs pointer identity. It otherwise
-// keeps the real scene/options and guest bundle scope, with fresh r10 sentinels preserving the r9
-// crash evidence.
+// Round 9 temporarily assigned TWAppDelegate during the scene callback and created the first
+// TWWindow/Twitch.RootViewController. Round 10 pinned YTAppDelegate, but round-10 scene attempts
+// still trapped inside Twitch and a background report still showed an OS_dispatch_source receiving
+// a UIKit delegate message. Round 11 disables all guest app/scene delegate callbacks and the host
+// scene-options hook. It keeps only the proven RTLD_LAZY dlopen/class probes, logs the host's
+// com.apple.security.application-groups entitlement, and queries the TWAppGroupName container URL.
+// This checks the suspected missing app-group prerequisite without risking another lifecycle call.
+// Old crash markers remain untouched; round 11 uses fresh auto-probe markers.
 //
 // Build: see build.sh (clang + iPhoneOS SDK, no Theos). Install name @rpath/MGLoader.dylib.
 
@@ -42,7 +43,7 @@
 #import <arpa/inet.h>
 #include <string.h>
 
-static const char *kRound = "round 10";
+static const char *kRound = "round 11";
 
 static NSMutableArray<NSString *> *gLines;
 static NSLock *gLock;
@@ -674,6 +675,28 @@ static BOOL AttemptGuestSceneConnect(void) {
     return connected;
 }
 
+// Round 11 diagnostic only: read the signed app-group entitlement and ask the sandbox for the
+// configured Twitch group container. This API returns nil when the installed profile does not grant
+// the group; it is read-only and runs without invoking either guest delegate.
+static void DescribeGuestAppGroup(void) {
+    NSString *guestApp = [GuestRoot() stringByAppendingPathComponent:@"Twitch.app"];
+    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
+                          [guestApp stringByAppendingPathComponent:@"Info.plist"]];
+    id groupValue = info[@"TWAppGroupName"];
+    NSString *groupName = [groupValue isKindOfClass:[NSString class]] ? groupValue : nil;
+    MGLOG(@"app groups entitlement %@", Entitlement(@"com.apple.security.application-groups"));
+    if (!groupName.length) {
+        MGLOG(@"guest app-group        TWAppGroupName absent/invalid");
+        return;
+    }
+    @try {
+        NSURL *url = [NSFileManager.defaultManager containerURLForSecurityApplicationGroupIdentifier:groupName];
+        MGLOG(@"guest app-group        %@ container=%@", groupName, url.path ?: @"<nil>");
+    } @catch (NSException *e) {
+        MGLOG(@"guest app-group        %@ lookup raised %@: %@", groupName, e.name, e.reason);
+    }
+}
+
 // --------------------------------------------------------------------------- //
 // the one real experiment
 // --------------------------------------------------------------------------- //
@@ -734,27 +757,25 @@ static void AttemptLoad(void) {
     MGLOG(@"guest class Twitch.SceneDelegate %@", DescribeRuntimeClass(@"Twitch.SceneDelegate"));
     MGLOG(@"guest class Swift SceneDelegate %@", DescribeRuntimeClass(@"_TtC6Twitch13SceneDelegate"));
     MGLOG(@"guest class RCTAppDependencyProvider %@", DescribeRuntimeClass(@"RCTAppDependencyProvider"));
-    if (AttemptGuestAppDelegateLaunch()) {
-        AttemptGuestSceneConnect();
-    } else {
-        MGLOG(@"guest scene callback   not attempted because app-delegate launch did not succeed");
-    }
+    DescribeGuestAppGroup();
+    MGLOG(@"guest callbacks        disabled (round-11 entitlement/container diagnostic only)");
 
-    // Do NOT call the executable entry point or UIApplicationMain.
+    // Do NOT initialize a guest delegate, connect a guest scene, call the executable entry point,
+    // or invoke UIApplicationMain in this diagnostic round.
 }
 
 // One automatic probe, guarded by a sentinel so a guest that crashes the process can only do it
 // once. The sentinel lives in Documents because the container survives launches, not installs.
 static void MGAutoProbe(void) {
-    // Versioned so earlier crash markers remain as evidence but do not suppress this test.
-    NSString *sentinel = [MGDocuments() stringByAppendingPathComponent:@"MG/dlopen-in-progress-r10"];
+    // Versioned so earlier crash markers remain as evidence but do not suppress this diagnostic.
+    NSString *sentinel = [MGDocuments() stringByAppendingPathComponent:@"MG/dlopen-in-progress-r11"];
     NSFileManager *fm = NSFileManager.defaultManager;
 
     MGLOG(@"auto probe            start");
     if ([fm fileExistsAtPath:sentinel]) {
         gLastLoad = @"skipped (previous crash)";
         MGLOG(@"auto probe            previous auto dlopen never returned; skipping");
-        MGLOG(@"auto probe            round-10 sentinel present; inspect crash log before retrying");
+        MGLOG(@"auto probe            round-11 sentinel present; inspect crash log before retrying");
         return;
     }
     if (![fm fileExistsAtPath:GuestExec()]) {
@@ -763,7 +784,7 @@ static void MGAutoProbe(void) {
         return;
     }
 
-    [@"round-10 auto dlopen in progress\n" writeToFile:sentinel atomically:YES
+    [@"round-11 diagnostic probe in progress\n" writeToFile:sentinel atomically:YES
                                      encoding:NSUTF8StringEncoding error:NULL];
     MGLOG(@"auto probe            guest present; log flushed, dlopen next");
     MGFlush();
@@ -1066,10 +1087,8 @@ static void MGLoaderStart(void) {
                                                            inDomains:NSUserDomainMask].firstObject;
     gMirrorPath = [[caches URLByAppendingPathComponent:@"mgloader.txt"] path];
 
-    BOOL sceneHook = MGInstallHostSceneOptionsCapture();
-
     MGLOG(@"MGLoader %s  %@ %@", kRound, @__DATE__, @__TIME__);
-    MGLOG(@"host scene options hook %@", sceneHook ? @"installed" : @"not installed");
+    MGLOG(@"host scene options hook disabled (round-11 diagnostic; no guest callbacks)");
     MGLOG(@"os                    %@", UIDevice.currentDevice.systemVersion);
     MGLOG(@"device                %@", UIDevice.currentDevice.model);
     MGLOG(@"bundle                %@", NSBundle.mainBundle.bundleIdentifier);
