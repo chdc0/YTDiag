@@ -1,5 +1,5 @@
-// MGLoader - Option A guest loader (round 14: virtualize Twitch's App Group container and defaults
-// suite under YouTube's data container; keep keychain untouched for this controlled test).
+// MGLoader - Option A guest loader (round 15: virtualize Twitch's App Group and forward the one
+// confirmed Twitch-only app-delegate getter, chromecastManager, without swapping UIApplication.delegate).
 //
 // Round 1 proved injection but its overlay was unusable: expanding the window moved the hard-coded
 // buttons to y=4, i.e. behind the clock, and they could not be tapped. Round 2 fixes that three ways:
@@ -27,9 +27,12 @@
 // confirmed the host lacks Twitch's app-group entitlement and the group's container URL is nil.
 // LiveContainer's r13 log proved the exact scene callback can return when Twitch's group container
 // is resolvable. It also showed 128 LiveContainer keychain groups, while SideStore has no keychain
-// groups, so round 14 isolates only App Group behavior: redirect the exact Twitch group container
-// and NSUserDefaults suite into YouTube's sandbox, leaving keychain behavior unchanged. LOAD stays
-// manual-only and single-flight; previous logs are preserved and checkpoints remain enabled.
+// groups, so round 14 virtualized the exact Twitch group container and NSUserDefaults suite into
+// YouTube's sandbox; the scene still returned under LiveContainer. Post-login playback then asked
+// YTAppDelegate for chromecastManager, which it lacks. Static inspection confirms TWAppDelegate
+// implements chromecastManager with an object return. Round 15 forwards only that selector to the
+// retained TWAppDelegate under Twitch's NSBundle.mainBundle scope. Keychain remains untouched.
+// LOAD stays manual-only/single-flight; previous logs are preserved and checkpoints remain enabled.
 // No entitlement is forged, no guest tree is re-signed here, and no UIApplicationMain or delegate
 // swap is used.
 //
@@ -46,7 +49,7 @@
 #import <arpa/inet.h>
 #include <string.h>
 
-static const char *kRound = "round 14";
+static const char *kRound = "round 15";
 
 static NSMutableArray<NSString *> *gLines;
 static NSLock *gLock;
@@ -62,6 +65,7 @@ static NSString * const kGuestSharePlaySkipThreadKey = @"MGLoader.SkipGuestShare
 static BOOL gLoadInProgress = NO;
 static NSLock *gLoadLock;
 static id gGuestAppDelegate;
+static NSBundle *gGuestBundle;
 static id gGuestSceneDelegate;
 static UIScene *gHostConnectedScene;
 static UISceneSession *gHostSceneSession;
@@ -337,6 +341,8 @@ static NSString *DescribeRuntimeClass(NSString *name) {
         @"application:didFinishLaunchingWithOptions:",
         @"application:configurationForConnectingSceneSession:options:",
         @"applicationDidBecomeActive:",
+        @"chromecastManager",
+        @"setUpSharePlay",
         @"scene:willConnectToSession:options:",
         @"sceneDidBecomeActive:",
         @"sceneWillEnterForeground:",
@@ -485,6 +491,65 @@ static BOOL MGInstallGuestSharePlayShim(void) {
     return class_addMethod(cls, selector, (IMP)MGSkipGuestSharePlay, "v16@0:8");
 }
 
+// Twitch's post-login playback requester asks UIApplication.delegate for chromecastManager.
+// YTAppDelegate lacks it; forward exactly that getter to the retained Twitch app delegate.
+static id MGForwardGuestChromecastManager(id self, SEL cmd) {
+    id guestDelegate = gGuestAppDelegate;
+    Method method = guestDelegate ? class_getInstanceMethod(object_getClass(guestDelegate), cmd) : NULL;
+    if (!method) {
+        MGLOG(@"guest delegate forward %@ unavailable; preserving unrecognized-selector behavior",
+              NSStringFromSelector(cmd));
+        [self doesNotRecognizeSelector:cmd];
+        return nil;
+    }
+
+    NSMutableDictionary *threadDictionary = NSThread.currentThread.threadDictionary;
+    id priorScopedBundle = threadDictionary[kGuestMainBundleThreadKey];
+    NSBundle *guestBundle = gGuestBundle ?: [NSBundle bundleWithPath:
+        [[GuestRoot() stringByAppendingPathComponent:@"Twitch.app"] stringByStandardizingPath]];
+    if (!priorScopedBundle && guestBundle) threadDictionary[kGuestMainBundleThreadKey] = guestBundle;
+    @try {
+        IMP imp = method_getImplementation(method);
+        id result = ((id (*)(id, SEL))imp)(guestDelegate, cmd);
+        MGLOG(@"guest delegate forward %@ -> %@ returned %@",
+              NSStringFromSelector(cmd), RuntimeObjectName(guestDelegate), RuntimeObjectName(result));
+        return result;
+    } @finally {
+        if (priorScopedBundle) threadDictionary[kGuestMainBundleThreadKey] = priorScopedBundle;
+        else [threadDictionary removeObjectForKey:kGuestMainBundleThreadKey];
+    }
+}
+
+static BOOL MGInstallGuestChromecastManagerForwarder(void) {
+    id hostDelegate = UIApplication.sharedApplication.delegate;
+    if (!hostDelegate) return NO;
+    SEL selector = NSSelectorFromString(@"chromecastManager");
+    Method guestMethod = gGuestAppDelegate
+        ? class_getInstanceMethod(object_getClass(gGuestAppDelegate), selector) : NULL;
+    if (!guestMethod) {
+        MGLOG(@"guest delegate forward chromecastManager not implemented by TWAppDelegate");
+        return NO;
+    }
+    const char *types = method_getTypeEncoding(guestMethod);
+    if (!types || strcmp(types, "@16@0:8") != 0) {
+        MGLOG(@"guest delegate forward chromecastManager unexpected encoding=%s",
+              types ?: "<nil>");
+        return NO;
+    }
+
+    Class cls = object_getClass(hostDelegate);
+    Method existing = class_getInstanceMethod(cls, selector);
+    if (existing) {
+        MGLOG(@"guest delegate forward chromecastManager left existing host implementation intact");
+        return YES;
+    }
+    BOOL added = class_addMethod(cls, selector, (IMP)MGForwardGuestChromecastManager, "@16@0:8");
+    MGLOG(@"guest delegate forward chromecastManager %@ (host=%@ guest=%@ encoding=%s)",
+          added ? @"installed" : @"FAILED", RuntimeObjectName(hostDelegate),
+          RuntimeObjectName(gGuestAppDelegate), types);
+    return added;
+}
+
 // Capture UIKit's real, immutable connection-options object for the host scene. The wrapper stores
 // the arguments and forwards the original YTSceneDelegate implementation unchanged; we never
 // fabricate UISceneConnectionOptions (UIKit marks its public init/new unavailable).
@@ -531,10 +596,10 @@ static BOOL MGInstallHostSceneOptionsCapture(void) {
 static BOOL AttemptGuestAppDelegateLaunch(void) {
     if (gGuestAppDelegate) return YES;
     MGLOG(@"guest launch callback   entering");
-    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-appdelegate-in-progress-r14"];
+    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-appdelegate-in-progress-r15"];
     NSFileManager *fm = NSFileManager.defaultManager;
     if ([fm fileExistsAtPath:attempted]) {
-        MGLOG(@"guest launch callback  skipped (round-14 prior attempt did not finish; marker retained)");
+        MGLOG(@"guest launch callback  skipped (round-15 prior attempt did not finish; marker retained)");
         return NO;
     }
 
@@ -594,6 +659,7 @@ static BOOL AttemptGuestAppDelegateLaunch(void) {
                 MGLOG(@"guest launch callback  TWAppDelegate init returned nil");
                 return;
             }
+            gGuestBundle = guestBundle;
             SEL selector = @selector(application:didFinishLaunchingWithOptions:);
             if (![instance respondsToSelector:selector]) {
                 MGLOG(@"guest launch callback  selector missing on %@", RuntimeObjectName(instance));
@@ -601,6 +667,8 @@ static BOOL AttemptGuestAppDelegateLaunch(void) {
             }
 
             id<UIApplicationDelegate> guestDelegate = (id<UIApplicationDelegate>)instance;
+            gGuestAppDelegate = instance;
+            MGInstallGuestChromecastManagerForwarder();
             BOOL result = [guestDelegate application:app didFinishLaunchingWithOptions:nil];
             id hostDelegateAfter = app.delegate;
             MGLOG(@"guest launch callback  returned %@ instance=%@",
@@ -610,13 +678,16 @@ static BOOL AttemptGuestAppDelegateLaunch(void) {
                   (unsigned long)app.windows.count, (unsigned long)app.connectedScenes.count,
                   (long)app.applicationState);
             if (result) {
-                gGuestAppDelegate = instance;
                 callbackSucceeded = YES;
                 [fm removeItemAtPath:attempted error:NULL];
             }
         } @catch (NSException *e) {
             MGLOG(@"guest launch callback  raised %@: %@", e.name, e.reason);
         } @finally {
+            if (!callbackSucceeded) {
+                gGuestAppDelegate = nil;
+                gGuestBundle = nil;
+            }
             if (priorScopedBundle) threadDictionary[kGuestMainBundleThreadKey] = priorScopedBundle;
             else [threadDictionary removeObjectForKey:kGuestMainBundleThreadKey];
             MGLOG(@"host main bundle restored %@ expected=%@",
@@ -666,10 +737,10 @@ static BOOL AttemptGuestSceneConnect(void) {
         return NO;
     }
 
-    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-scene-in-progress-r14"];
+    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-scene-in-progress-r15"];
     NSFileManager *fm = NSFileManager.defaultManager;
     if ([fm fileExistsAtPath:attempted]) {
-        MGLOG(@"guest scene callback   skipped (round-14 marker remains from an incomplete attempt)");
+        MGLOG(@"guest scene callback   skipped (round-15 marker remains from an incomplete attempt)");
         return NO;
     }
 
@@ -910,7 +981,7 @@ static void AttemptLoad(void) {
 static void MGAutoProbe(void) {
     // Round 13 disables automatic probing. The round-12 probe and manual LOAD could overlap; make
     // LOAD the only trigger and keep this function as a documented no-op for compatibility.
-    MGLOG(@"auto probe            disabled in round 14; tap LOAD once for a single controlled attempt");
+    MGLOG(@"auto probe            disabled in round 15; tap LOAD once for a single controlled attempt");
 }
 
 // --------------------------------------------------------------------------- //
@@ -1268,6 +1339,6 @@ static void MGLoaderStart(void) {
         MGFlush();
     });
 
-    MGLOG(@"auto probe            disabled in round 14; tap LOAD once for a controlled attempt");
+    MGLOG(@"auto probe            disabled in round 15; tap LOAD once for a controlled attempt");
     MGFlush();
 }
