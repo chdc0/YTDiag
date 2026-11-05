@@ -1,5 +1,5 @@
-// MGLoader - Option A guest loader (round 11: passive app-group entitlement/container diagnostic;
-// no guest lifecycle callbacks).
+// MGLoader - Option A guest loader (round 12: skip only Twitch SharePlay setup and keep the host
+// UIApplication delegate installed during the guest scene callback).
 //
 // Round 1 proved injection but its overlay was unusable: expanding the window moved the hard-coded
 // buttons to y=4, i.e. behind the clock, and they could not be tapped. Round 2 fixes that three ways:
@@ -22,13 +22,13 @@
 // host state stayed unchanged. Round 8 captured the host's real UISceneConnectionOptions and
 // reached Twitch.SceneDelegate. That callback asked YTAppDelegate for Twitch-only setUpSharePlay.
 // Round 9 temporarily assigned TWAppDelegate during the scene callback and created the first
-// TWWindow/Twitch.RootViewController. Round 10 pinned YTAppDelegate, but round-10 scene attempts
-// still trapped inside Twitch and a background report still showed an OS_dispatch_source receiving
-// a UIKit delegate message. Round 11 disables all guest app/scene delegate callbacks and the host
-// scene-options hook. It keeps only the proven RTLD_LAZY dlopen/class probes, logs the host's
-// com.apple.security.application-groups entitlement, and queries the TWAppGroupName container URL.
-// This checks the suspected missing app-group prerequisite without risking another lifecycle call.
-// Old crash markers remain untouched; round 11 uses fresh auto-probe markers.
+// TWWindow/Twitch.RootViewController, but later backgrounding crashed. Round 10 pinned YTAppDelegate,
+// but scene initialization still trapped and UIKit state restoration remained unstable. Round 11
+// confirmed the host lacks Twitch's app-group entitlement and the group's container URL is nil.
+// Round 12 honors the SharePlay compromise: add a narrow setUpSharePlay shim to YTAppDelegate and
+// make it a no-op only while Twitch's guest scene callback is active. The existing UIApplication
+// delegate stays installed. All other guest startup remains enabled, so additional app-group
+// dependencies may still fail. No UIApplicationMain, fake scene/options objects, or delegate swap.
 //
 // Build: see build.sh (clang + iPhoneOS SDK, no Theos). Install name @rpath/MGLoader.dylib.
 
@@ -43,7 +43,7 @@
 #import <arpa/inet.h>
 #include <string.h>
 
-static const char *kRound = "round 11";
+static const char *kRound = "round 12";
 
 static NSMutableArray<NSString *> *gLines;
 static NSLock *gLock;
@@ -53,9 +53,9 @@ static void (^gOnLog)(void);        // set by the panel; called on the main queu
 static NSString *gLastLoad = @"not run";
 static IMP gOriginalMainBundleIMP;
 static NSString * const kGuestMainBundleThreadKey = @"MGLoader.ThreadGuestMainBundle";
+static NSString * const kGuestSharePlaySkipThreadKey = @"MGLoader.SkipGuestSharePlay";
 static id gGuestAppDelegate;
 static id gGuestSceneDelegate;
-static id __strong gHostAppDelegate; // strong pin; UIApplication.delegate is assign
 static UIScene *gHostConnectedScene;
 static UISceneSession *gHostSceneSession;
 static UISceneConnectionOptions *gHostSceneConnectionOptions;
@@ -373,6 +373,28 @@ static BOOL MGInstallMainBundleScope(void) {
     return installed;
 }
 
+// SharePlay's setUpSharePlay requires Twitch's unavailable App Group. Add a narrow shim to the host
+// delegate only if it does not already respond. The method does nothing only while the guest scene
+// callback's thread-local opt-out flag is active.
+static void MGSkipGuestSharePlay(id self, SEL cmd) {
+    if ([NSThread.currentThread.threadDictionary[kGuestSharePlaySkipThreadKey] boolValue]) {
+        MGLOG(@"guest SharePlay setup skipped (app-group entitlement unavailable)");
+    } else {
+        MGLOG(@"guest SharePlay shim    call outside guest scene callback; preserving unrecognized-selector behavior");
+        [self doesNotRecognizeSelector:cmd];
+    }
+}
+
+static BOOL MGInstallGuestSharePlayShim(void) {
+    id hostDelegate = UIApplication.sharedApplication.delegate;
+    if (!hostDelegate) return NO;
+    Class cls = object_getClass(hostDelegate);
+    SEL selector = NSSelectorFromString(@"setUpSharePlay");
+    Method existing = class_getInstanceMethod(cls, selector);
+    if (existing) return method_getImplementation(existing) == (IMP)MGSkipGuestSharePlay;
+    return class_addMethod(cls, selector, (IMP)MGSkipGuestSharePlay, "v16@0:8");
+}
+
 // Capture UIKit's real, immutable connection-options object for the host scene. The wrapper stores
 // the arguments and forwards the original YTSceneDelegate implementation unchanged; we never
 // fabricate UISceneConnectionOptions (UIKit marks its public init/new unavailable).
@@ -418,10 +440,10 @@ static BOOL MGInstallHostSceneOptionsCapture(void) {
 // successful initialization keeps the instance alive for the following scene callback.
 static BOOL AttemptGuestAppDelegateLaunch(void) {
     if (gGuestAppDelegate) return YES;
-    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-appdelegate-in-progress-r10"];
+    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-appdelegate-in-progress-r12"];
     NSFileManager *fm = NSFileManager.defaultManager;
     if ([fm fileExistsAtPath:attempted]) {
-        MGLOG(@"guest launch callback  skipped (round-10 prior attempt did not finish; marker retained)");
+        MGLOG(@"guest launch callback  skipped (round-12 prior attempt did not finish; marker retained)");
         return NO;
     }
 
@@ -552,10 +574,10 @@ static BOOL AttemptGuestSceneConnect(void) {
         return NO;
     }
 
-    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-scene-in-progress-r10"];
+    NSString *attempted = [MGDocuments() stringByAppendingPathComponent:@"MG/guest-scene-in-progress-r12"];
     NSFileManager *fm = NSFileManager.defaultManager;
     if ([fm fileExistsAtPath:attempted]) {
-        MGLOG(@"guest scene callback   skipped (round-10 marker remains from an incomplete attempt)");
+        MGLOG(@"guest scene callback   skipped (round-12 marker remains from an incomplete attempt)");
         return NO;
     }
 
@@ -569,6 +591,19 @@ static BOOL AttemptGuestSceneConnect(void) {
         MGLOG(@"guest scene callback   willConnect selector missing");
         return NO;
     }
+
+    __block BOOL sharePlayShimInstalled = NO;
+    dispatch_block_t installSharePlayShim = ^{
+        sharePlayShimInstalled = MGInstallGuestSharePlayShim();
+    };
+    if (NSThread.isMainThread) installSharePlayShim();
+    else dispatch_sync(dispatch_get_main_queue(), installSharePlayShim);
+    if (!sharePlayShimInstalled) {
+        MGLOG(@"guest scene callback   could not install no-op setUpSharePlay shim on the host delegate");
+        return NO;
+    }
+    MGLOG(@"guest SharePlay shim    installed on %@; no-op scoped to scene callback",
+          RuntimeObjectName(UIApplication.sharedApplication.delegate));
 
     // The versioned marker is written before class realization/init/callback. Leave it in place on
     // a crash; remove it only after the callback returns normally.
@@ -585,16 +620,12 @@ static BOOL AttemptGuestSceneConnect(void) {
 
         UIApplication *app = UIApplication.sharedApplication;
         id appDelegateBefore = app.delegate;
-        if (!gHostAppDelegate) gHostAppDelegate = appDelegateBefore;
-        id hostDelegateRestore = gHostAppDelegate ?: appDelegateBefore;
         id sceneDelegateBefore = scene.delegate;
         UIWindowScene *windowScene = (UIWindowScene *)scene;
         NSUInteger windowsBefore = app.windows.count;
         NSUInteger sceneWindowsBefore = windowScene.windows.count;
-        MGLOG(@"guest scene before     appDelegate=%@/%p pinnedHost=%@/%p sceneDelegate=%@ windows=%lu sceneWindows=%lu state=%ld",
-              RuntimeObjectName(appDelegateBefore), appDelegateBefore,
-              RuntimeObjectName(hostDelegateRestore), hostDelegateRestore,
-              RuntimeObjectName(sceneDelegateBefore),
+        MGLOG(@"guest scene before     appDelegate=%@ sceneDelegate=%@ windows=%lu sceneWindows=%lu state=%ld",
+              RuntimeObjectName(appDelegateBefore), RuntimeObjectName(sceneDelegateBefore),
               (unsigned long)windowsBefore, (unsigned long)sceneWindowsBefore,
               (long)app.applicationState);
 
@@ -608,6 +639,7 @@ static BOOL AttemptGuestSceneConnect(void) {
 
         NSMutableDictionary *threadDictionary = NSThread.currentThread.threadDictionary;
         id priorScopedBundle = threadDictionary[kGuestMainBundleThreadKey];
+        id priorSharePlaySkip = threadDictionary[kGuestSharePlaySkipThreadKey];
         threadDictionary[kGuestMainBundleThreadKey] = guestBundle;
         @try {
             NSBundle *observedMainBundle = NSBundle.mainBundle;
@@ -625,25 +657,24 @@ static BOOL AttemptGuestSceneConnect(void) {
                 return;
             }
             gGuestSceneDelegate = instance;
-            if (![gGuestAppDelegate respondsToSelector:NSSelectorFromString(@"setUpSharePlay")]) {
+            if (![appDelegateBefore respondsToSelector:NSSelectorFromString(@"setUpSharePlay")]) {
                 gGuestSceneDelegate = nil;
-                MGLOG(@"guest scene callback   TWAppDelegate does not implement setUpSharePlay");
+                MGLOG(@"guest scene callback   host delegate lacks SharePlay shim selector");
                 return;
             }
 
             id<UISceneDelegate> delegate = (id<UISceneDelegate>)instance;
-            MGLOG(@"guest app delegate     temporarily setting UIApplication.delegate %@/%p -> %@/%p",
-                  RuntimeObjectName(appDelegateBefore), appDelegateBefore,
-                  RuntimeObjectName(gGuestAppDelegate), gGuestAppDelegate);
-            app.delegate = (id<UIApplicationDelegate>)gGuestAppDelegate;
+            MGLOG(@"guest scene handoff    UIApplication.delegate remains %@",
+                  RuntimeObjectName(app.delegate));
+            threadDictionary[kGuestSharePlaySkipThreadKey] = @YES;
             [delegate scene:scene willConnectToSession:session options:options];
             connected = YES;
 
             id appDelegateAfter = app.delegate;
             id sceneDelegateAfter = scene.delegate;
             MGLOG(@"guest scene returned   sceneDelegate=%@", RuntimeObjectName(instance));
-            MGLOG(@"guest scene after      appDelegate=%@ isGuest=%@ sceneDelegate=%@ unchanged=%@ windows=%lu sceneWindows=%lu state=%ld",
-                  RuntimeObjectName(appDelegateAfter), appDelegateAfter == gGuestAppDelegate ? @"yes" : @"NO",
+            MGLOG(@"guest scene after      appDelegate=%@ unchanged=%@ sceneDelegate=%@ unchanged=%@ windows=%lu sceneWindows=%lu state=%ld",
+                  RuntimeObjectName(appDelegateAfter), appDelegateAfter == appDelegateBefore ? @"yes" : @"NO",
                   RuntimeObjectName(sceneDelegateAfter), sceneDelegateAfter == sceneDelegateBefore ? @"yes" : @"NO",
                   (unsigned long)app.windows.count, (unsigned long)windowScene.windows.count,
                   (long)app.applicationState);
@@ -659,10 +690,11 @@ static BOOL AttemptGuestSceneConnect(void) {
             if (scene.delegate != sceneDelegateBefore) scene.delegate = sceneDelegateBefore;
             MGLOG(@"host scene delegate restored %@ expected=%@",
                   RuntimeObjectName(scene.delegate), RuntimeObjectName(sceneDelegateBefore));
-            if (app.delegate != hostDelegateRestore) app.delegate = hostDelegateRestore;
-            MGLOG(@"host app delegate restored %@/%p expected=%@/%p",
-                  RuntimeObjectName(app.delegate), app.delegate,
-                  RuntimeObjectName(hostDelegateRestore), hostDelegateRestore);
+            if (app.delegate != appDelegateBefore) app.delegate = appDelegateBefore;
+            MGLOG(@"host app delegate unchanged %@ expected=%@",
+                  RuntimeObjectName(app.delegate), RuntimeObjectName(appDelegateBefore));
+            if (priorSharePlaySkip) threadDictionary[kGuestSharePlaySkipThreadKey] = priorSharePlaySkip;
+            else [threadDictionary removeObjectForKey:kGuestSharePlaySkipThreadKey];
             if (priorScopedBundle) threadDictionary[kGuestMainBundleThreadKey] = priorScopedBundle;
             else [threadDictionary removeObjectForKey:kGuestMainBundleThreadKey];
             MGLOG(@"host main bundle restored %@", NSBundle.mainBundle.bundlePath);
@@ -675,9 +707,8 @@ static BOOL AttemptGuestSceneConnect(void) {
     return connected;
 }
 
-// Round 11 diagnostic only: read the signed app-group entitlement and ask the sandbox for the
-// configured Twitch group container. This API returns nil when the installed profile does not grant
-// the group; it is read-only and runs without invoking either guest delegate.
+// Read the signed app-group entitlement and ask the sandbox for Twitch's configured group container.
+// This remains a passive diagnostic before the guarded guest lifecycle callbacks below.
 static void DescribeGuestAppGroup(void) {
     NSString *guestApp = [GuestRoot() stringByAppendingPathComponent:@"Twitch.app"];
     NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
@@ -758,24 +789,29 @@ static void AttemptLoad(void) {
     MGLOG(@"guest class Swift SceneDelegate %@", DescribeRuntimeClass(@"_TtC6Twitch13SceneDelegate"));
     MGLOG(@"guest class RCTAppDependencyProvider %@", DescribeRuntimeClass(@"RCTAppDependencyProvider"));
     DescribeGuestAppGroup();
-    MGLOG(@"guest callbacks        disabled (round-11 entitlement/container diagnostic only)");
 
-    // Do NOT initialize a guest delegate, connect a guest scene, call the executable entry point,
-    // or invoke UIApplicationMain in this diagnostic round.
+    // Keep the diagnostic first. Then exercise the existing guest lifecycle callbacks with fresh
+    // r12 sentinels; never call the executable entry point or UIApplicationMain.
+    BOOL launched = AttemptGuestAppDelegateLaunch();
+    MGLOG(@"guest launch callback  %@", launched ? @"returned successfully" : @"not completed");
+    if (launched) {
+        BOOL connected = AttemptGuestSceneConnect();
+        MGLOG(@"guest scene callback   %@", connected ? @"returned successfully" : @"not completed/skipped");
+    }
 }
 
 // One automatic probe, guarded by a sentinel so a guest that crashes the process can only do it
 // once. The sentinel lives in Documents because the container survives launches, not installs.
 static void MGAutoProbe(void) {
-    // Versioned so earlier crash markers remain as evidence but do not suppress this diagnostic.
-    NSString *sentinel = [MGDocuments() stringByAppendingPathComponent:@"MG/dlopen-in-progress-r11"];
+    // Versioned so earlier crash markers remain as evidence but do not suppress this test.
+    NSString *sentinel = [MGDocuments() stringByAppendingPathComponent:@"MG/dlopen-in-progress-r12"];
     NSFileManager *fm = NSFileManager.defaultManager;
 
     MGLOG(@"auto probe            start");
     if ([fm fileExistsAtPath:sentinel]) {
         gLastLoad = @"skipped (previous crash)";
         MGLOG(@"auto probe            previous auto dlopen never returned; skipping");
-        MGLOG(@"auto probe            round-11 sentinel present; inspect crash log before retrying");
+        MGLOG(@"auto probe            round-12 sentinel present; inspect crash log before retrying");
         return;
     }
     if (![fm fileExistsAtPath:GuestExec()]) {
@@ -784,7 +820,7 @@ static void MGAutoProbe(void) {
         return;
     }
 
-    [@"round-11 diagnostic probe in progress\n" writeToFile:sentinel atomically:YES
+    [@"round-12 guest scene probe in progress\n" writeToFile:sentinel atomically:YES
                                      encoding:NSUTF8StringEncoding error:NULL];
     MGLOG(@"auto probe            guest present; log flushed, dlopen next");
     MGFlush();
@@ -1088,7 +1124,8 @@ static void MGLoaderStart(void) {
     gMirrorPath = [[caches URLByAppendingPathComponent:@"mgloader.txt"] path];
 
     MGLOG(@"MGLoader %s  %@ %@", kRound, @__DATE__, @__TIME__);
-    MGLOG(@"host scene options hook disabled (round-11 diagnostic; no guest callbacks)");
+    BOOL sceneCaptureReady = MGInstallHostSceneOptionsCapture();
+    MGLOG(@"host scene options hook %@", sceneCaptureReady ? @"installed" : @"not installed (scene callback unavailable)");
     MGLOG(@"os                    %@", UIDevice.currentDevice.systemVersion);
     MGLOG(@"device                %@", UIDevice.currentDevice.model);
     MGLOG(@"bundle                %@", NSBundle.mainBundle.bundleIdentifier);
