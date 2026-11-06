@@ -1,0 +1,228 @@
+{
+  "source_commit": "d0d33c272231090cf9e9e2045fb2a1fc05c632df",
+  "deb_sha256": "5923619efd0408c91e601bfbc53114528875d5325e393e7814405271f0708942",
+  "files": {
+    "EeveeSpotify.dylib": {
+      "size": 4209888,
+      "sha256": "9d2c1ffbfa19e6bebee5dce319269cb77be29486a76cdeea5cf6828e5864c445"
+    },
+    "zxPluginsInject.dylib": {
+      "size": 71568,
+      "sha256": "ecdeda780e6f30a25c473faabbfbb41888abd2d2b3691dc0bd495b2e40875bcb"
+    },
+    "EeveeSwiftProtobuf.framework": [
+      {
+        "path": "EeveeSwiftProtobuf.framework/EeveeSwiftProtobuf",
+        "size": 5842992,
+        "sha256": "ab0ce0f4192ffa0b5510cc17af1d489e8c4efb35dee075b95efeb3e0a7583d69"
+      },
+      {
+        "path": "EeveeSwiftProtobuf.framework/Info.plist",
+        "size": 280,
+        "sha256": "dea45cd6c8337ff22cbba3349e7ed1bdc440057f9c9c228a8558ca544df03597"
+      },
+      {
+        "path": "EeveeSwiftProtobuf.framework/Modules/EeveeSwiftProtobuf.swiftmodule/arm64-apple-ios.abi.json",
+        "size": 5937573,
+        "sha256": "e5157c4b8d63843073eed7c45a393b52e018d3c2acae916e5cba73242bd51a2d"
+      },
+      {
+        "path": "EeveeSwiftProtobuf.framework/Modules/EeveeSwiftProtobuf.swiftmodule/arm64-apple-ios.swiftdoc",
+        "size": 437752,
+        "sha256": "e3dfd5a059497a9b56ccbcabf6eff309ee86a063eedf9220d1c161b65f98156a"
+      },
+      {
+        "path": "EeveeSwiftProtobuf.framework/Modules/EeveeSwiftProtobuf.swiftmodule/arm64-apple-ios.swiftinterface",
+        "size": 200038,
+        "sha256": "7a24abc408da484e33d407ca3bb5c7b486de60018e4cda8de2b81db2ec1e8870"
+      },
+      {
+        "path": "EeveeSwiftProtobuf.framework/Modules/EeveeSwiftProtobuf.swiftmodule/arm64-apple-ios.swiftmodule",
+        "size": 1468568,
+        "sha256": "32a05716a667534eedd565e9b47834623c711052d0d8e5186d7037b87ee2d0c8"
+      },
+      {
+        "path": "EeveeSwiftProtobuf.framework/Modules/EeveeSwiftProtobuf.swiftmodule/arm64e-apple-ios.abi.json",
+        "size": 5937573,
+        "sha256": "e5157c4b8d63843073eed7c45a393b52e018d3c2acae916e5cba73242bd51a2d"
+      },
+      {
+        "path": "EeveeSwiftProtobuf.framework/Modules/EeveeSwiftProtobuf.swiftmodule/arm64e-apple-ios.swiftdoc",
+        "size": 437752,
+        "sha256": "13722628683f6a50b4f4f953a3056cec033409a22a3a474ab6b5fa6dc5fa39d6"
+      },
+      {
+        "path": "EeveeSwiftProtobuf.framework/Modules/EeveeSwiftProtobuf.swiftmodule/arm64e-apple-ios.swiftinterface",
+        "size": 200039,
+        "sha256": "c3c9b274a20e11c5a3f1f9a091a37d1a0a79c26bff58c929ae769619814c2a23"
+      },
+      {
+        "path": "EeveeSwiftProtobuf.framework/Modules/EeveeSwiftProtobuf.swiftmodule/arm64e-apple-ios.swiftmodule",
+        "size": 1468568,
+        "sha256": "9c3357cf871f187c335be7eefe4b84c8677458f852a309fd7f55a016c66d7a06"
+      }
+    ],
+    "EeveeSpotify.bundle": [
+      {
+        "path": "EeveeSpotify.bundle/EeveeLogo.png",
+        "size": 23772,
+        "sha256": "d0ce3e1fb5ec1367c645b339c9b668195c10bbf62248cf2bc7a02dcddf107f3f"
+      },
+      {
+        "path": "EeveeSpotify.bundle/Info.plist",
+        "size": 82,
+        "sha256": "66cf42f7499f353f3116f752ded3bb9423d460156a06a8c7823cd2951fe759bb"
+      },
+      {
+        "path": "EeveeSpotify.bundle/ar-EG.lproj/Localizable.strings",
+        "size": 36723,
+        "sha256": "e73fbb861f8c9b3698917ff61d9bf83c61bdacb03d61fe26665ae4e3c04ab883"
+      },
+      {
+        "path": "EeveeSpotify.bundle/az.lproj/Localizable.strings",
+        "size": 36009,
+        "sha256": "e89d271d92a1e5d82de8f6583f9ad88b196995a3098a6a0f8c46794a7921881e"
+      },
+      {
+        "path": "EeveeSpotify.bundle/bg.lproj/Localizable.strings",
+        "size": 37135,
+        "sha256": "dfa17237569323befc9f07a486a1315dad8106993450f69d1137a2eabb810316"
+      },
+      {
+        "path": "EeveeSpotify.bundle/ca.lproj/Localizable.strings",
+        "size": 35973,
+        "sha256": "d2b6a5adc884ef08272eaf4cfab5b156423c6bc3b9290fdc868eabdba28cb408"
+      },
+      {
+        "path": "EeveeSpotify.bundle/da.lproj/Localizable.strings",
+        "size": 32843,
+        "sha256": "22e03afb21caf9603b0d7e7c2306282a433c64b99e08b4a2a91344496ceaef89"
+      },
+      {
+        "path": "EeveeSpotify.bundle/de-CH.lproj/Localizable.strings",
+        "size": 33107,
+        "sha256": "0558d44177d914269dd46629793b569959cc44f8c5afd049692c5dc39e4c62b3"
+      },
+      {
+        "path": "EeveeSpotify.bundle/de.lproj/Localizable.strings",
+        "size": 34008,
+        "sha256": "b62704add9a817a1d47779abd2379b762d55755d53f383e2be1d63791506e9fe"
+      },
+      {
+        "path": "EeveeSpotify.bundle/en.lproj/Localizable.strings",
+        "size": 25812,
+        "sha256": "d361f8e7e6f75671be075f2dfdb8e9ee7eec7c455a4b226ea00261a26364e18b"
+      },
+      {
+        "path": "EeveeSpotify.bundle/es.lproj/Localizable.strings",
+        "size": 35179,
+        "sha256": "e0a01b9018faf5b83bab4c4d79a6a4901b36098a5ff6af168afc227e9b3966b6"
+      },
+      {
+        "path": "EeveeSpotify.bundle/fa.lproj/Localizable.strings",
+        "size": 40102,
+        "sha256": "d9ff6e76b46e2886925db3b198f92e09a9e818232937272d7b42d6beca01202a"
+      },
+      {
+        "path": "EeveeSpotify.bundle/fr.lproj/Localizable.strings",
+        "size": 36227,
+        "sha256": "0f1c902b6e26cc81022cc89894db62a6f64a89812362f99ed0f07f468959735e"
+      },
+      {
+        "path": "EeveeSpotify.bundle/github.png",
+        "size": 8639,
+        "sha256": "c92faffeb8714d6c4cdcfd98d6f80c06b9971af38de9bfcea483e35414c62356"
+      },
+      {
+        "path": "EeveeSpotify.bundle/hr.lproj/Localizable.strings",
+        "size": 33913,
+        "sha256": "7c960d6026ef520bfcc1319e244ef106b8ef6c42fcc36faf6c4151334ec0d4c7"
+      },
+      {
+        "path": "EeveeSpotify.bundle/hu.lproj/Localizable.strings",
+        "size": 37056,
+        "sha256": "52d7579884e2e0155cdbc7ef20b06fb3bd3bbae6149202bf4dcf94efa0b3e087"
+      },
+      {
+        "path": "EeveeSpotify.bundle/it.lproj/Localizable.strings",
+        "size": 32821,
+        "sha256": "53771736b04dc21e8574d1938702d77f3d84bd684e0dc35e9a91a6330d09e0a8"
+      },
+      {
+        "path": "EeveeSpotify.bundle/ja.lproj/Localizable.strings",
+        "size": 25954,
+        "sha256": "7a976f64655a225fb2b95869aee045d25bb084513417ac041c2fe4378f24ba22"
+      },
+      {
+        "path": "EeveeSpotify.bundle/ko.lproj/Localizable.strings",
+        "size": 26779,
+        "sha256": "0b2c83d17dee91909ef182419c91b499d27c1bb5e2146fcf1542cfcc7ab1c867"
+      },
+      {
+        "path": "EeveeSpotify.bundle/np.lproj/Localizable.strings",
+        "size": 31571,
+        "sha256": "7ac34b28d97adc31af1a2afcc88fa9599b201371b27ab8b6fd9797adc20d92e1"
+      },
+      {
+        "path": "EeveeSpotify.bundle/pl.lproj/Localizable.strings",
+        "size": 39896,
+        "sha256": "6b1e10fa9f28e2b973501ffbf0fdaffa747cad2b2caef8a672138ee9f2999879"
+      },
+      {
+        "path": "EeveeSpotify.bundle/pt-BR.lproj/Localizable.strings",
+        "size": 33738,
+        "sha256": "c43f57870c87666f13237244d10ef094afb24e626a2d007bd2ddbef919aeb92e"
+      },
+      {
+        "path": "EeveeSpotify.bundle/pt.lproj/Localizable.strings",
+        "size": 33994,
+        "sha256": "a1406797e9b1d9004b465d7e1683aea0f5940d460959e42937b8e6bbf446e2af"
+      },
+      {
+        "path": "EeveeSpotify.bundle/resolveconfiguration.bnk",
+        "size": 79724,
+        "sha256": "67739d75cf86e7d48dcddac0a0a36d5ccc1317f9ef3605b9e5fb0bdc0dd49dc5"
+      },
+      {
+        "path": "EeveeSpotify.bundle/resolveconfiguration_9_1_76.bnk",
+        "size": 99439,
+        "sha256": "6b3ca5af9c686c6899386fa3900d8306608d2d2093b30964eaba06742123907f"
+      },
+      {
+        "path": "EeveeSpotify.bundle/ro.lproj/Localizable.strings",
+        "size": 35707,
+        "sha256": "8734fb052b928bac161891fffcb5119269213d449b8ea1be5338a33d107a794e"
+      },
+      {
+        "path": "EeveeSpotify.bundle/ru.lproj/Localizable.strings",
+        "size": 36595,
+        "sha256": "71fd6ee7bae76578846551365fa374c49f9285dcf4e5f353d279fb428cdd8b70"
+      },
+      {
+        "path": "EeveeSpotify.bundle/tr.lproj/Localizable.strings",
+        "size": 40978,
+        "sha256": "9d77bb7358ee2c700d0d55e703f1598de4ed33e2102cc12872743ee6b2e7bb7c"
+      },
+      {
+        "path": "EeveeSpotify.bundle/uk.lproj/Localizable.strings",
+        "size": 36792,
+        "sha256": "0be91740c6ec748f112ca1d44bad9bebba83215a8e2a0eff15ea1ed7b2847b3e"
+      },
+      {
+        "path": "EeveeSpotify.bundle/vi.lproj/Localizable.strings",
+        "size": 40401,
+        "sha256": "d572cbd75f3d759c800f85528cba71490ce7e7cfd3d386538b03f9d54fd3dba7"
+      },
+      {
+        "path": "EeveeSpotify.bundle/zh-CN.lproj/Localizable.strings",
+        "size": 22337,
+        "sha256": "8e1507de54fe221302a764fd91a530373c4a66ab1541cb5581524f2565d9aa9c"
+      },
+      {
+        "path": "EeveeSpotify.bundle/zh-TW.lproj/Localizable.strings",
+        "size": 22239,
+        "sha256": "7e3fc6bdf84c64cd028a7d9462bb9b18db0e867ac38c92807cff680e1f7bc5be"
+      }
+    ]
+  }
+}
