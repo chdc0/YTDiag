@@ -1,0 +1,185 @@
+name: build-eevee-fork-payload
+
+# Build only the public fork's runtime payload. The Spotify IPA remains local and is
+# never uploaded to CI; Windows grafts these payload files into the user's existing IPA.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build-eevee-fork-payload.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-eevee-fork-payload
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    env:
+      THEOS: ${{ github.workspace }}/theos
+      THEOS_PACKAGE_SCHEME: rootless
+      SWIFTPROTOBUF_VERSION: "1.29.0"
+      REPO_SLUG: bejminliou/EeveeSpotifyReincarnated
+      BRANCH_NAME: Master
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout EeveeSpotify fork at reviewed revision
+        uses: actions/checkout@v4
+        with:
+          repository: bejminliou/EeveeSpotifyReincarnated
+          ref: d0d33c272231090cf9e9e2045fb2a1fc05c632df
+          path: eevee
+          submodules: recursive
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "26.3.0"
+
+      - name: Checkout Theos
+        uses: actions/checkout@v4
+        with:
+          repository: theos/theos
+          path: theos
+          submodules: recursive
+
+      - name: Install build tools
+        run: |
+          brew install make dpkg ldid
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+          if ! xcrun -f metal >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+
+      - name: Test, build fork tweak, and stage runtime payload
+        run: |
+          set -euo pipefail
+          cd eevee
+          {
+            echo "fork_commit=$(git rev-parse HEAD)"
+            echo "fork_branch=$(git branch --show-current || true)"
+
+            swiftc Sources/EeveeSpotify/Premium/Helpers/BrowsitaSectionStripper.swift \
+              Tests/BrowsitaSectionStripper/main.swift -o "$RUNNER_TEMP/browsita-tests"
+            "$RUNNER_TEMP/browsita-tests"
+
+            swiftc Sources/EeveeSpotify/Shared/Models/Extensions/URL+Extension.swift \
+              Tests/URLAdClassification/main.swift -o "$RUNNER_TEMP/url-ad-tests"
+            "$RUNNER_TEMP/url-ad-tests"
+
+            swiftc Sources/EeveeSpotify/Premium/Helpers/ServerSidedFeaturePolicy.swift \
+              Tests/ServerSidedFeaturePolicy/main.swift -o "$RUNNER_TEMP/server-policy-tests"
+            "$RUNNER_TEMP/server-policy-tests"
+
+            swiftc Sources/EeveeSpotify/Premium/Helpers/BundledConfigurationPolicy.swift \
+              Tests/BundledConfigurationPolicy/main.swift -o "$RUNNER_TEMP/bundled-config-tests"
+            "$RUNNER_TEMP/bundled-config-tests"
+
+            swiftc Tests/CustomTabsActivation/main.swift -o "$RUNNER_TEMP/custom-tabs-tests"
+            "$RUNNER_TEMP/custom-tabs-tests"
+
+            swiftc Tests/HookSourceAudit/main.swift -o "$RUNNER_TEMP/hook-source-audit"
+            "$RUNNER_TEMP/hook-source-audit"
+
+            python3 Tests/ResolveConfigurationSnapshot/test.py
+
+            make build-eeveeswiftprotobuf
+            make clean || true
+            make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+
+            chmod +x Tools/build-zxpi.sh
+            Tools/build-zxpi.sh
+
+            DEB_PATH="$(ls -t packages/com.eevee.spotify_*.deb | head -n 1)"
+            test -n "$DEB_PATH"
+            EXTRACT="$RUNNER_TEMP/eevee-deb"
+            STAGE="$RUNNER_TEMP/eevee-payload"
+            rm -rf "$EXTRACT" "$STAGE"
+            mkdir -p "$EXTRACT" "$STAGE"
+            dpkg-deb -x "$DEB_PATH" "$EXTRACT"
+
+            DYLIB="$(find "$EXTRACT" -name EeveeSpotify.dylib -type f | head -n 1)"
+            FRAMEWORK="$(find "$EXTRACT" -type d -name EeveeSwiftProtobuf.framework | head -n 1)"
+            BUNDLE="$(find "$EXTRACT" -type d -name EeveeSpotify.bundle | head -n 1)"
+            test -n "$DYLIB" -a -n "$FRAMEWORK" -a -n "$BUNDLE"
+            test -f packages/zxPluginsInject.dylib
+
+            cp "$DYLIB" "$STAGE/EeveeSpotify.dylib"
+            cp packages/zxPluginsInject.dylib "$STAGE/zxPluginsInject.dylib"
+            cp -R "$FRAMEWORK" "$STAGE/EeveeSwiftProtobuf.framework"
+            cp -R "$BUNDLE" "$STAGE/EeveeSpotify.bundle"
+
+            mkdir -p "$GITHUB_WORKSPACE/artifact"
+            (cd "$STAGE" && zip -qry "$GITHUB_WORKSPACE/artifact/eevee-r220-payload.zip" .)
+            python3 - "$GITHUB_WORKSPACE/artifact/eevee-r220-payload.json" "$DEB_PATH" "$STAGE" <<'PY'
+          import hashlib, json, os, pathlib, sys
+          report, deb, root = sys.argv[1:]
+          root = pathlib.Path(root)
+          def digest(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for chunk in iter(lambda: f.read(1 << 20), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+          files = {}
+          for name in ["EeveeSpotify.dylib", "zxPluginsInject.dylib"]:
+              path = root / name
+              files[name] = {"size": path.stat().st_size, "sha256": digest(path)}
+          for name in ["EeveeSwiftProtobuf.framework", "EeveeSpotify.bundle"]:
+              entries = []
+              for path in sorted((root / name).rglob("*")):
+                  if path.is_file():
+                      entries.append({"path": path.relative_to(root).as_posix(),
+                                      "size": path.stat().st_size, "sha256": digest(path)})
+              files[name] = entries
+          with open(report, "w", encoding="utf-8") as f:
+              json.dump({"source_commit": os.popen("git rev-parse HEAD").read().strip(),
+                         "deb_sha256": digest(deb), "files": files}, f, indent=2)
+              f.write("\n")
+          PY
+            shasum -a 256 "$GITHUB_WORKSPACE/artifact/eevee-r220-payload.zip" \
+              > "$GITHUB_WORKSPACE/artifact/eevee-r220-payload.zip.sha256"
+          } 2>&1 | tee "$GITHUB_WORKSPACE/build-eevee.log"
+
+      - name: Upload payload artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: EeveeSpotify-r220-runtime-payload
+          path: |
+            artifact/eevee-r220-payload.zip
+            artifact/eevee-r220-payload.zip.sha256
+            artifact/eevee-r220-payload.json
+          if-no-files-found: error
+
+      - name: Commit build result for local pickup
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p artifact
+          if [ ! -f artifact/eevee-r220-payload.zip ]; then
+            cp build-eevee.log artifact/eevee-r220-last-build.log 2>/dev/null || true
+          else
+            rm -f artifact/eevee-r220-last-build.log
+          fi
+          git config user.name "eevee-payload-ci"
+          git config user.email "eevee-payload-ci@users.noreply.github.com"
+          if [ -f artifact/eevee-r220-payload.zip ]; then
+            git add artifact/eevee-r220-payload.zip artifact/eevee-r220-payload.zip.sha256 \
+                    artifact/eevee-r220-payload.json
+          fi
+          if [ -f artifact/eevee-r220-last-build.log ]; then
+            git add artifact/eevee-r220-last-build.log
+          fi
+          if git diff --cached --quiet; then
+            echo "no artifact changes"
+            exit 0
+          fi
+          git commit -m "Eevee fork r220 payload build result"
+          git push
